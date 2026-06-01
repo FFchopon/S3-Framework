@@ -1,0 +1,217 @@
+"""Generic planning integration for DeepAgent (skill-agnostic).
+
+References:
+- https://docs.langchain.com/oss/python/deepagents/overview
+- https://docs.langchain.com/oss/python/deepagents/deep-research
+- https://docs.langchain.com/oss/python/langchain/middleware/built-in
+- https://docs.langchain.com/oss/python/deepagents/customization
+
+Domain-specific workflows belong in each skill's SKILL.md, not here.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
+from langchain_core.messages import ToolMessage
+from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command
+from deepagents import HarnessProfile, register_harness_profile
+
+PLANNING_DEBUG_ENV = "DEEPAGENT_DEBUG_PLANNING"
+WRITE_TODOS_TOOL_NAME = "write_todos"
+
+# USER slot: prepended before SDK BASE_AGENT_PROMPT (see create_deep_agent).
+PLANNING_WORKFLOW_SYSTEM_PROMPT = """\
+# Agent workflow
+
+Follow this workflow for complex, multi-step requests:
+
+1. **Plan first**: Call `write_todos` to break the work into focused, actionable steps **before any other tool**.
+2. **Execute**: Work through todos in order. Mark each step `in_progress` before starting and `completed` immediately when done.
+3. **Adapt**: Revise the todo list when new information changes the plan.
+4. **Deliver**: After all todos are complete, provide the final answer in a normal assistant message.
+
+## Skills
+
+When the user's task matches an available skill, that skill's `SKILL.md` (e.g. `/skills/<name>/SKILL.md`) is the source of truth for **what** to do: workflows, resources, tools, and output format. Execute from the document itself—numbered steps, checklists, code blocks—not from a separate "planning" section (skills do not need one).
+
+For complex skill-backed work:
+
+1. Call `write_todos` first with steps you can infer from skill metadata and the user request.
+2. `read_file` the skill's `SKILL.md` when you need the full procedure; revise the todo list so it reflects the workflow sections in that file.
+3. Complete todos by following the skill document.
+
+## Planning rules
+
+- For **non-trivial** tasks, `write_todos` MUST be your **first** tool call.
+- Do **not** call any other tool until the initial todo list exists.
+- Keep todos specific and outcome-oriented (e.g. "Load required inputs", "Run core analysis", "Produce final summary").
+- For trivial one-step questions, skip the todo list and answer directly.
+
+## Simple vs complex
+
+| Complex — plan first | Simple — no todo list |
+|----------------------|------------------------|
+| 3+ distinct steps or tool calls | Single factual question |
+| Multiple files, skills, or subtasks | Answer in one message |
+| User gave multiple tasks | Pure conversation |
+| Outcome may change as you learn more | No tools needed |
+"""
+
+# TodoListMiddleware system fragment (appended on each model call).
+PLANNING_TODO_SYSTEM_PROMPT = """\
+## `write_todos`
+
+You have access to the `write_todos` tool to help you manage and plan complex objectives.
+
+### Mandatory planning phase (non-trivial tasks)
+
+For complex objectives (3+ steps, multiple tools, or multiple user tasks):
+
+1. Your **first** action MUST be a single `write_todos` call that lists all steps.
+2. Do **not** invoke any other tool in the same turn as that first `write_todos` call.
+3. Only after the todo list exists may you call other tools.
+
+Use this tool for complex objectives to ensure that you are tracking each necessary step.
+This tool is very helpful for planning complex objectives, and for breaking down these larger complex objectives into smaller steps.
+
+It is critical that you mark todos as completed as soon as you are done with a step. Do not batch up multiple steps before marking them as completed.
+For simple objectives that only require a few steps, it is better to just complete the objective directly and NOT use this tool.
+Writing todos takes time and tokens, use it when it is helpful for managing complex many-step problems! But not for simple few-step requests.
+
+## Important To-Do List Usage Notes to Remember
+
+- The `write_todos` tool should never be called multiple times in parallel.
+- Don't be afraid to revise the To-Do list as you go. New information may reveal new tasks that need to be done, or old tasks that are irrelevant.
+- After reading a skill's `SKILL.md`, update todos to match that file's workflow sections (not a dedicated planning chapter).
+
+## Finishing a task
+
+When you finish all work, write your final answer in the message AFTER your last `write_todos` call — not in the same turn as that call. Start the final message with the substantive content the user asked for — the data, computation, summary, or analysis. The user wants the result, not confirmation that the work is done.
+"""
+
+PLANNING_TODO_TOOL_DESCRIPTION = """\
+Use this tool to create and manage a structured task list for your current work session.
+
+## Planning phase (required for complex work)
+
+If the task needs 3+ steps, multiple tools, or multiple user tasks: call `write_todos` **first**, before any other tool. List every step you will take; mark the first task `in_progress`.
+
+Only use this tool if you think it will help you stay organized. If the user's request is trivial and takes less than 3 steps, do NOT use this tool and just do the task directly.
+
+## When to Use This Tool
+
+1. Complex multi-step tasks — When a task requires 3 or more distinct steps or actions
+2. Non-trivial tasks — Careful planning or multiple operations are needed
+3. User explicitly requests a todo list
+4. User provides multiple tasks
+5. The plan may need future revisions based on results from the first few steps
+6. The task matches a skill — infer initial todos from skill metadata, then read `SKILL.md` and align todos with its documented workflow
+
+## How to Use This Tool
+
+1. When you start working on a task — Mark it as in_progress BEFORE beginning work.
+2. After completing a task — Mark it as completed and add any new follow-up tasks discovered during implementation.
+3. You can also update future tasks. Don't change previously completed tasks.
+4. You can make several updates to the todo list at once.
+
+## When NOT to Use This Tool
+
+Skip when: single straightforward task, trivial request, fewer than 3 trivial steps, or purely conversational.
+
+## Task States
+
+- pending: not started
+- in_progress: currently working (keep at least one in_progress until all done)
+- completed: finished successfully — only when FULLY accomplished
+
+When you write the todo list, mark your first task(s) as in_progress immediately.
+
+## When You Finish
+
+`write_todos` tracks your work; it does not deliver the answer. The user's requested output must appear as text after your final `write_todos` call.
+"""
+
+
+def planning_debug_enabled(cli_flag: bool = False) -> bool:
+    import os
+
+    if cli_flag:
+        return True
+    return os.environ.get(PLANNING_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def format_plan_for_console(todos: Any) -> str:
+    if isinstance(todos, list):
+        return json.dumps(todos, ensure_ascii=False, indent=2)
+    return json.dumps(todos, ensure_ascii=False, indent=2, default=str)
+
+
+def emit_planning_debug(todos: Any, *, stream: Any = sys.stderr) -> None:
+    print("\n agent planning...\n", file=stream)
+    print(format_plan_for_console(todos), file=stream)
+    print(file=stream)
+
+
+class PlanningDebugMiddleware(AgentMiddleware):
+    """Log write_todos invocations to stderr when planning debug is enabled."""
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        if request.tool_call.get("name") == WRITE_TODOS_TOOL_NAME:
+            emit_planning_debug(request.tool_call.get("args", {}).get("todos", []))
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        if request.tool_call.get("name") == WRITE_TODOS_TOOL_NAME:
+            emit_planning_debug(request.tool_call.get("args", {}).get("todos", []))
+        return await handler(request)
+
+
+class PlanningTodoListMiddleware(TodoListMiddleware):
+    """Subclass so HarnessProfile can exclude default TodoListMiddleware only."""
+
+    pass
+
+
+def create_planning_todo_middleware() -> PlanningTodoListMiddleware:
+    return PlanningTodoListMiddleware(
+        system_prompt=PLANNING_TODO_SYSTEM_PROMPT,
+        tool_description=PLANNING_TODO_TOOL_DESCRIPTION,
+    )
+
+
+def build_planning_middleware(*, debug_planning: bool = False) -> list[AgentMiddleware]:
+    stack: list[AgentMiddleware] = [create_planning_todo_middleware()]
+    if debug_planning:
+        stack.append(PlanningDebugMiddleware())
+    return stack
+
+
+_PLANNING_PROFILE_OVERLAY = HarnessProfile(
+    excluded_middleware=frozenset({TodoListMiddleware}),
+)
+
+_registered = False
+
+
+def register_planning_harness_profile() -> None:
+    """Merge planning profile overlay onto provider keys used by this demo."""
+    global _registered
+    if _registered:
+        return
+    for provider in ("openai", "deepseek"):
+        register_harness_profile(provider, _PLANNING_PROFILE_OVERLAY)
+    _registered = True

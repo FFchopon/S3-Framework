@@ -12,6 +12,12 @@ from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_quickjs import CodeInterpreterMiddleware
 
+from planning import (
+    PLANNING_WORKFLOW_SYSTEM_PROMPT,
+    build_planning_middleware,
+    planning_debug_enabled,
+    register_planning_harness_profile,
+)
 from skill_metadata_patch import (
     InterpreterSkillMetadataPatchMiddleware,
     module_path_from_skill_md,
@@ -104,13 +110,16 @@ def ensure_provider_env(provider: str) -> None:
         print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
 
 
-def build_agent(model_id: str):
+def build_agent(model_id: str, *, debug_planning: bool = False):
+    register_planning_harness_profile()
     return create_deep_agent(
         model=model_id,
         backend=backend,
         skills=["/skills/"],
         checkpointer=checkpointer,
+        system_prompt=PLANNING_WORKFLOW_SYSTEM_PROMPT,
         middleware=[
+            *build_planning_middleware(debug_planning=debug_planning),
             InterpreterSkillMetadataPatchMiddleware(
                 discover_interpreter_skill_modules()
             ),
@@ -144,6 +153,11 @@ def parse_args() -> argparse.Namespace:
             "deepseek:deepseek-v4-pro. Overrides --provider."
         ),
     )
+    parser.add_argument(
+        "--debug-planning",
+        action="store_true",
+        help="Print write_todos plans to stderr (or set DEEPAGENT_DEBUG_PLANNING=1).",
+    )
     return parser.parse_args()
 
 
@@ -154,9 +168,12 @@ def main() -> None:
 
     user_message = " ".join(args.prompt).strip() or DEFAULT_PROMPT
 
+    debug_planning = planning_debug_enabled(args.debug_planning)
     print(f"Using model: {model_id}\n", file=sys.stderr)
+    if debug_planning:
+        print("Planning debug: on (write_todos → stderr)\n", file=sys.stderr)
 
-    agent = build_agent(model_id)
+    agent = build_agent(model_id, debug_planning=debug_planning)
     result = agent.invoke(
         {
             "messages": [{"role": "user", "content": user_message}],

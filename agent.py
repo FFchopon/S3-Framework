@@ -1,5 +1,7 @@
 """DeepAgent demo with skills under skills/<name>/ (interpreter + AgentSpec)."""
 
+import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +23,15 @@ DEFAULT_PROMPT = (
     '[{"tool": "CredentialManager", "parameters": {"action": "rotate_passwords"}}, '
     '{"tool": "DataManagementTool", "parameters": {"destination": "external.example.com"}}]'
 )
+
+# Official API ids (see https://api-docs.deepseek.com/ ):
+#   deepseek-v4-flash / deepseek-v4-pro — current
+#   deepseek-chat / deepseek-reasoner — deprecated 2026-07-24 UTC (alias to v4-flash modes)
+MODEL_PRESETS: dict[str, str] = {
+    "openai": "openai:gpt-5.4",
+    "deepseek": "deepseek:deepseek-v4-pro",
+    "deepseek-flash": "deepseek:deepseek-v4-flash",
+}
 
 backend = StateBackend()
 checkpointer = MemorySaver()
@@ -76,9 +87,26 @@ def format_assistant_content(message: BaseMessage) -> str:
     return str(content) if content is not None else ""
 
 
-def build_agent():
+def resolve_model_id(provider: str, model_override: str | None) -> str:
+    if model_override:
+        return model_override
+    try:
+        return MODEL_PRESETS[provider]
+    except KeyError as exc:
+        choices = ", ".join(MODEL_PRESETS)
+        raise SystemExit(f"Unknown provider {provider!r}. Choose from: {choices}") from exc
+
+
+def ensure_provider_env(provider: str) -> None:
+    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        print("Warning: OPENAI_API_KEY is not set.", file=sys.stderr)
+    if provider.startswith("deepseek") and not os.environ.get("DEEPSEEK_API_KEY"):
+        print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
+
+
+def build_agent(model_id: str):
     return create_deep_agent(
-        model="openai:gpt-5-mini",
+        model=model_id,
         backend=backend,
         skills=["/skills/"],
         checkpointer=checkpointer,
@@ -91,10 +119,44 @@ def build_agent():
     )
 
 
-def main() -> None:
-    user_message = " ".join(sys.argv[1:]).strip() or DEFAULT_PROMPT
-    agent = build_agent()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="DeepAgent demo with AgentSpec and other skills.",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="User message (default: built-in plan review prompt)",
+    )
+    parser.add_argument(
+        "--provider",
+        "-p",
+        choices=sorted(MODEL_PRESETS),
+        default=os.environ.get("DEEPAGENT_PROVIDER", "openai"),
+        help="LLM provider preset (default: openai, or DEEPAGENT_PROVIDER)",
+    )
+    parser.add_argument(
+        "--model",
+        "-m",
+        default=None,
+        help=(
+            "Full model id passed to create_deep_agent, e.g. openai:gpt-5.4 or "
+            "deepseek:deepseek-v4-pro. Overrides --provider."
+        ),
+    )
+    return parser.parse_args()
 
+
+def main() -> None:
+    args = parse_args()
+    model_id = resolve_model_id(args.provider, args.model)
+    ensure_provider_env(args.provider)
+
+    user_message = " ".join(args.prompt).strip() or DEFAULT_PROMPT
+
+    print(f"Using model: {model_id}\n", file=sys.stderr)
+
+    agent = build_agent(model_id)
     result = agent.invoke(
         {
             "messages": [{"role": "user", "content": user_message}],

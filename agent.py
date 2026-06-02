@@ -19,6 +19,9 @@ from planning import (
     register_planning_harness_profile,
 )
 from stage_capture import (
+    create_input_stage_middleware,
+    create_output_stage_middleware,
+    create_post_step_middleware,
     create_stage_capture_middleware,
     stage_debug_enabled,
 )
@@ -129,7 +132,10 @@ def build_agent(
         system_prompt=PLANNING_WORKFLOW_SYSTEM_PROMPT,
         middleware=[
             *build_planning_middleware(debug_planning=debug_planning),
+            create_input_stage_middleware(debug=debug_stages),
             create_stage_capture_middleware(debug=debug_stages),
+            create_post_step_middleware(debug=debug_stages),
+            create_output_stage_middleware(debug=debug_stages),
             InterpreterSkillMetadataPatchMiddleware(
                 discover_interpreter_skill_modules()
             ),
@@ -172,7 +178,7 @@ def parse_args() -> argparse.Namespace:
         "--debug-stages",
         action="store_true",
         help=(
-            "Print tool_selection / tool_observation payloads to stderr "
+            "Print input / tool_selection / tool_observation / post_step / output payloads to stderr "
             "(or set DEEPAGENT_DEBUG_STAGES=1)."
         ),
     )
@@ -193,7 +199,7 @@ def main() -> None:
         print("Planning debug: on (write_todos → stderr)\n", file=sys.stderr)
     if debug_stages:
         print(
-            "Stage debug: on (tool_selection after_model, tool_observation before_model → stderr)\n",
+            "Stage debug: on (input, tool_selection, tool_observation, post_step, output → stderr)\n",
             file=sys.stderr,
         )
 

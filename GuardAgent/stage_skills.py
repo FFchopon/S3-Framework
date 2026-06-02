@@ -28,6 +28,7 @@ KNOWN_STAGES = (
     STAGE_PLANNING,
     STAGE_TOOL_OBSERVATION,
     # Reserved for later Guard skills:
+    # "post_step",
     # "memory",
     # "tool_selection",
     # "tool_execution",

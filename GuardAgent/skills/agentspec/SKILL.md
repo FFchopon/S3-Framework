@@ -1,24 +1,24 @@
 ---
 name: agentspec
-description: Use to enforce rule-based safety checks on agent-generated plans before tool execution.
-stage: planning
+description: Enforce rule-based safety checks on selected tool calls before tool execution (predicate-based).
+stage: tool_selection
 module: index.ts
 ---
 
-# AgentSpec
+# AgentSpec (tool selection)
 
-Detect risky intent when a plan includes specific tool invocation patterns by applying matched rule checks **before execution**.
+Detect risky tool usage by evaluating selected tool calls against deterministic predicate rules **before execution**.
 
 ## Trigger timing
 
-**After** the plan is generated and **before** tool execution.
+**After** the model selects tools (tool calls are pending) and **before** tool execution.
 
 ## Inspection target
 
-Planned tool invocations, for example:
+Tool calls chosen by the model, for example:
 
 ```json
-{"tool": "DataManagementTool", "parameters": {"destination": "external.example.com"}}
+{"id":"call_1","name":"write_file","args":{"file_path":"/notes.txt","content":"hello"}}
 ```
 
 ## Resources
@@ -44,28 +44,38 @@ const { RULES_JSON_PATH, loadRulesFromJson, matchActivatedRules } =
   await import("@/skills/agentspec");
 
 // rulesJsonText = full content from read_file(RULES_JSON_PATH)
-const plan = [
-  { tool: "DataManagementTool", parameters: { destination: "ext" } },
+const toolCalls = [
+  { id: "call_1", name: "write_file", args: { file_path: "/notes.txt" } },
 ];
 
-const step1 = matchActivatedRules(plan, rulesJsonText);
+const step1 = matchActivatedRules(toolCalls, rulesJsonText);
 step1;
 ```
 
 `loadRulesFromJson` parses the JSON resource.  
-`matchActivatedRules` activates only rules whose `trigger` equals a planned `tool`.
+`matchActivatedRules` activates only rules whose `trigger` equals a tool call `name`.
 
-### Step 2 — Evaluate risk (model)
+### Step 2 — Evaluate predicate violations (eval)
 
-For each entry in `step1.activatedRules`, apply the rule `check` to `matchedInvocations`.
+Evaluate each activated rule using the deterministic predicate function (do not judge violations by reasoning alone):
+
+```typescript
+const { evaluateToolSelection } = await import("@/skills/agentspec");
+const step2 = evaluateToolSelection(toolCalls, rulesJsonText);
+step2;
+```
+
+### Step 3 — Final decision (model)
+
+If `step2.blocked` is true, the final decision must be `disallow` and you must explain which rule(s) were violated and why the tool execution must not proceed.
 
 ## Output format
 
 After completing the workflow, your final response **must** include:
 
 1. **decision**: `allow` or `disallow`
-   - Use `allow` only when no activated rule indicates the plan is risky.
-   - Use `disallow` when any activated rule’s `check` is violated or risk cannot be ruled out.
+   - Use `allow` only when no predicate violation is detected.
+   - Use `disallow` when any predicate violation is detected.
 
 2. **reason**: 2–3 sentences explaining the decision
-   - Reference matched tools, activated rules, and the main risk factors (or why the plan is acceptable).
+   - Reference matched tools, activated rules, and violated predicates (or why the selection is acceptable).

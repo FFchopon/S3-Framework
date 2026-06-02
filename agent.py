@@ -18,6 +18,10 @@ from planning import (
     planning_debug_enabled,
     register_planning_harness_profile,
 )
+from stage_capture import (
+    create_stage_capture_middleware,
+    stage_debug_enabled,
+)
 from skill_metadata_patch import (
     InterpreterSkillMetadataPatchMiddleware,
     module_path_from_skill_md,
@@ -110,7 +114,12 @@ def ensure_provider_env(provider: str) -> None:
         print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
 
 
-def build_agent(model_id: str, *, debug_planning: bool = False):
+def build_agent(
+    model_id: str,
+    *,
+    debug_planning: bool = False,
+    debug_stages: bool = False,
+):
     register_planning_harness_profile()
     return create_deep_agent(
         model=model_id,
@@ -120,6 +129,7 @@ def build_agent(model_id: str, *, debug_planning: bool = False):
         system_prompt=PLANNING_WORKFLOW_SYSTEM_PROMPT,
         middleware=[
             *build_planning_middleware(debug_planning=debug_planning),
+            create_stage_capture_middleware(debug=debug_stages),
             InterpreterSkillMetadataPatchMiddleware(
                 discover_interpreter_skill_modules()
             ),
@@ -158,6 +168,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print write_todos plans to stderr (or set DEEPAGENT_DEBUG_PLANNING=1).",
     )
+    parser.add_argument(
+        "--debug-stages",
+        action="store_true",
+        help=(
+            "Print tool_selection / tool_observation payloads to stderr "
+            "(or set DEEPAGENT_DEBUG_STAGES=1)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -169,11 +187,21 @@ def main() -> None:
     user_message = " ".join(args.prompt).strip() or DEFAULT_PROMPT
 
     debug_planning = planning_debug_enabled(args.debug_planning)
+    debug_stages = stage_debug_enabled(args.debug_stages)
     print(f"Using model: {model_id}\n", file=sys.stderr)
     if debug_planning:
         print("Planning debug: on (write_todos → stderr)\n", file=sys.stderr)
+    if debug_stages:
+        print(
+            "Stage debug: on (tool_selection after_model, tool_observation before_model → stderr)\n",
+            file=sys.stderr,
+        )
 
-    agent = build_agent(model_id, debug_planning=debug_planning)
+    agent = build_agent(
+        model_id,
+        debug_planning=debug_planning,
+        debug_stages=debug_stages,
+    )
     result = agent.invoke(
         {
             "messages": [{"role": "user", "content": user_message}],

@@ -1,6 +1,7 @@
 ---
 name: prasedata
 description: Sanitize tool observations by stripping unsafe injection patterns and returning minimal text for downstream reasoning.
+stage: tool_observation
 module: index.ts
 ---
 

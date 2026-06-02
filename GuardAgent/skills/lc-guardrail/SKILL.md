@@ -1,6 +1,7 @@
 ---
 name: lc-guardrail
 description: Enforce input-stage guardrails by blocking specific patterns in user messages before the agent acts.
+stage: input
 module: index.ts
 ---
 

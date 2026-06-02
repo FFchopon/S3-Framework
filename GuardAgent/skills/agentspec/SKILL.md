@@ -1,6 +1,7 @@
 ---
 name: agentspec
 description: Use to enforce rule-based safety checks on agent-generated plans before tool execution.
+stage: planning
 module: index.ts
 ---
 

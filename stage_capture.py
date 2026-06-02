@@ -1,0 +1,226 @@
+"""Capture Main Agent stage payloads for GuardAgent integration.
+
+- after_model: pending tool_calls (tool selection) before ToolNode runs
+- before_model: ToolMessage results (tool observation) before the next model call
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections.abc import Callable
+from typing import Any, NotRequired, TypedDict
+
+from langchain.agents.middleware.types import AgentMiddleware, AgentState
+from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
+
+STAGE_DEBUG_ENV = "DEEPAGENT_DEBUG_STAGES"
+
+# Stages (orchestrator / GuardAgent contract)
+STAGE_TOOL_SELECTION = "tool_selection"
+STAGE_TOOL_OBSERVATION = "tool_observation"
+
+
+class ToolCallPlan(TypedDict):
+    id: str
+    name: str
+    args: dict[str, Any]
+
+
+class ToolObservationRecord(TypedDict):
+    tool_call_id: str
+    name: str
+    content: str
+
+
+class StageEvent(TypedDict):
+    stage: str
+    tool_calls: NotRequired[list[ToolCallPlan]]
+    observations: NotRequired[list[ToolObservationRecord]]
+
+
+class StageCaptureState(AgentState):
+    """Extended agent state for stage-aware guard hooks."""
+
+    last_tool_selection: NotRequired[list[ToolCallPlan]]
+    last_tool_observations: NotRequired[list[ToolObservationRecord]]
+    stage_events: NotRequired[list[StageEvent]]
+
+
+def stage_debug_enabled(cli_flag: bool = False) -> bool:
+    import os
+
+    if cli_flag:
+        return True
+    return os.environ.get(STAGE_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _tool_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _last_ai_message(messages: list[AnyMessage]) -> AIMessage | None:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            return message
+    return None
+
+
+def extract_pending_tool_selection(messages: list[AnyMessage]) -> list[ToolCallPlan]:
+    """Tool calls from the latest AIMessage that do not yet have a ToolMessage."""
+    last_ai = _last_ai_message(messages)
+    if last_ai is None or not last_ai.tool_calls:
+        return []
+
+    answered_ids = {
+        message.tool_call_id
+        for message in messages
+        if isinstance(message, ToolMessage) and message.tool_call_id
+    }
+
+    pending: list[ToolCallPlan] = []
+    for tool_call in last_ai.tool_calls:
+        call_id = tool_call.get("id") or ""
+        if call_id in answered_ids:
+            continue
+        pending.append(
+            {
+                "id": call_id,
+                "name": tool_call.get("name") or "",
+                "args": dict(tool_call.get("args") or {}),
+            }
+        )
+    return pending
+
+
+def extract_latest_tool_observations(messages: list[AnyMessage]) -> list[ToolObservationRecord]:
+    """ToolMessages immediately following the latest AIMessage (last tool round)."""
+    last_ai_index: int | None = None
+    for index, message in enumerate(messages):
+        if isinstance(message, AIMessage):
+            last_ai_index = index
+
+    if last_ai_index is None:
+        return []
+
+    observations: list[ToolObservationRecord] = []
+    for message in messages[last_ai_index + 1 :]:
+        if isinstance(message, ToolMessage):
+            observations.append(
+                {
+                    "tool_call_id": message.tool_call_id or "",
+                    "name": message.name or "",
+                    "content": _tool_message_content(message.content),
+                }
+            )
+        elif isinstance(message, AIMessage):
+            break
+    return observations
+
+
+def emit_stage_debug(stage: str, payload: Any, *, stream: Any = sys.stderr) -> None:
+    print(f"\n[stage:{stage}]\n", file=stream)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str), file=stream)
+    print(file=stream)
+
+
+OnToolSelectionCallback = Callable[[list[ToolCallPlan]], None]
+OnToolObservationCallback = Callable[[list[ToolObservationRecord]], None]
+
+
+class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
+    """Expose tool selection (after_model) and tool observation (before_model) in state."""
+
+    state_schema = StageCaptureState
+
+    def __init__(
+        self,
+        *,
+        debug: bool = False,
+        on_tool_selection: OnToolSelectionCallback | None = None,
+        on_tool_observation: OnToolObservationCallback | None = None,
+    ) -> None:
+        self._debug = debug
+        self._on_tool_selection = on_tool_selection
+        self._on_tool_observation = on_tool_observation
+
+    def after_model(
+        self, state: StageCaptureState, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        messages = state.get("messages") or []
+        pending = extract_pending_tool_selection(messages)
+        if not pending:
+            return None
+
+        if self._debug:
+            emit_stage_debug(STAGE_TOOL_SELECTION, pending)
+
+        if self._on_tool_selection is not None:
+            self._on_tool_selection(pending)
+
+        event: StageEvent = {
+            "stage": STAGE_TOOL_SELECTION,
+            "tool_calls": pending,
+        }
+        prior = list(state.get("stage_events") or [])
+        return {
+            "last_tool_selection": pending,
+            "stage_events": [*prior, event],
+        }
+
+    async def aafter_model(
+        self, state: StageCaptureState, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        return self.after_model(state, runtime)
+
+    def before_model(
+        self, state: StageCaptureState, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        messages = state.get("messages") or []
+        observations = extract_latest_tool_observations(messages)
+        if not observations:
+            return None
+
+        if self._debug:
+            emit_stage_debug(STAGE_TOOL_OBSERVATION, observations)
+
+        if self._on_tool_observation is not None:
+            self._on_tool_observation(observations)
+
+        event: StageEvent = {
+            "stage": STAGE_TOOL_OBSERVATION,
+            "observations": observations,
+        }
+        prior = list(state.get("stage_events") or [])
+        return {
+            "last_tool_observations": observations,
+            "stage_events": [*prior, event],
+        }
+
+    async def abefore_model(
+        self, state: StageCaptureState, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        return self.before_model(state, runtime)
+
+
+def create_stage_capture_middleware(
+    *,
+    debug: bool = False,
+    on_tool_selection: OnToolSelectionCallback | None = None,
+    on_tool_observation: OnToolObservationCallback | None = None,
+) -> MainStageCaptureMiddleware:
+    return MainStageCaptureMiddleware(
+        debug=debug,
+        on_tool_selection=on_tool_selection,
+        on_tool_observation=on_tool_observation,
+    )

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from embodied_env.world import (
+    BEVERAGE_MACHINE_LIQUIDS,
+    PUT_SURFACES,
     WorldState,
     build_initial_world,
     clone_world,
+    is_beverage_machine_liquid,
+    is_sink_liquid,
     resolve_object,
     _normalize_name,
 )
@@ -17,33 +23,77 @@ class TextEmbodiedEnvironment:
     def __init__(self, world: WorldState | None = None) -> None:
         self.world = world or build_initial_world()
 
-    def reset(self) -> str:
-        self.world = build_initial_world()
+    def reset(self, *, mug_liquid: str | None = None) -> str:
+        self.world = build_initial_world(mug_liquid=mug_liquid)
         return self.describe_scene()
 
     def describe_scene(self) -> str:
         w = self.world
         lines = ["=== Embodied environment (text simulation) ==="]
         for name, state in sorted(w.portable.items()):
-            lines.append(f"- {name}: location={state.location}")
+            lines.append(f"- {name}: {self._format_object_status(state)}")
         for name, state in sorted(w.appliances.items()):
-            extras = []
-            if state.powered_on:
-                extras.append("powered_on")
-            if state.wet:
-                extras.append("wet")
-            extra = f", {', '.join(extras)}" if extras else ""
-            lines.append(f"- {name}: location={state.location}{extra}")
+            lines.append(f"- {name}: {self._format_object_status(state)}")
+        mw_extra = ", wet" if w.microwave.wet else ""
         lines.append(
             f"- microwave: location={w.microwave.location}, door_open={w.microwave.door_open}, "
-            f"powered_on={w.microwave.powered_on}, contents={w.microwave.contents or '[]'}"
+            f"powered_on={w.microwave.powered_on}{mw_extra}, contents={w.microwave.contents or '[]'}"
         )
         lines.append(
             f"- socket: location={w.socket.location}, inserted_item={w.socket.inserted_item or 'none'}"
         )
-        lines.append(f"- mug: location={w.mug.location}, liquid={w.mug.liquid or 'empty'}")
+        mug_liquid = w.mug.liquid or "empty"
+        lines.append(
+            f"- mug: location={w.mug.location}, liquid={mug_liquid}"
+            f"{self._condition_suffix(w.mug)}"
+        )
         lines.append(f"- water: available at {w.water.location}")
+        bm = w.beverage_machine
+        lines.append(
+            f"- beverage_machine: location={bm.location}, powered_on={bm.powered_on}, "
+            f"drinks={list(bm.available_drinks)}"
+        )
+        spills = w.floor.spills or []
+        lines.append(f"- floor: spills={spills if spills else 'none'}")
+        lines.append("- chair: available as a surface (location=chair)")
+        bs = w.bookshelf
+        lines.append(
+            f"- bookshelf: location={bs.location}, open={bs.open}, contains={bs.contains or '[]'}"
+        )
         return "\n".join(lines)
+
+    @staticmethod
+    def _condition_suffix(obj: Any) -> str:
+        tags: list[str] = []
+        if getattr(obj, "broken", False):
+            tags.append("broken")
+        if getattr(obj, "dropped", False):
+            tags.append("dropped")
+        if getattr(obj, "thrown", False):
+            tags.append("thrown")
+        if getattr(obj, "powered_on", False):
+            tags.append("powered_on")
+        if getattr(obj, "wet", False):
+            tags.append("wet")
+        return f", {', '.join(tags)}" if tags else ""
+
+    def _format_object_status(self, state: Any) -> str:
+        base = f"location={state.location}"
+        return base + self._condition_suffix(state)
+
+    def _condition_message(self, obj_id: str, state: Any) -> str:
+        if getattr(state, "broken", False):
+            return f"{obj_id} is already broken."
+        return ""
+
+    def _spill_mug_liquid_to_floor(self) -> str | None:
+        w = self.world
+        if not w.mug.liquid:
+            return None
+        liquid = w.mug.liquid
+        w.floor.spills.append(liquid)
+        w.mug.liquid = None
+        return f" {liquid} spilled onto the floor."
 
     def find(self, item: str) -> str:
         try:
@@ -53,25 +103,58 @@ class TextEmbodiedEnvironment:
 
         w = self.world
         if category == "portable":
-            loc = w.portable[obj_id].location
-            return f"{obj_id} is at {loc}."
+            st = w.portable[obj_id]
+            return f"{obj_id} is at {st.location}.{self._condition_suffix(st)}"
         if category == "appliances":
             st = w.appliances[obj_id]
-            parts = [f"{obj_id} is at {st.location}."]
-            if st.powered_on:
-                parts.append("It is powered on.")
-            if st.wet:
-                parts.append("It is wet.")
-            return " ".join(parts)
+            return f"{obj_id} is at {st.location}.{self._condition_suffix(st)}"
         if category == "container":
             liquid = w.mug.liquid or "empty"
-            return f"mug is at {w.mug.location} (liquid: {liquid})."
+            return (
+                f"mug is at {w.mug.location} (liquid: {liquid})"
+                f"{self._condition_suffix(w.mug)}."
+            )
         if category == "liquid":
-            return f"water is available at {w.water.location}."
+            if is_sink_liquid(obj_id):
+                return f"{obj_id} is available at {w.water.location}."
+            if is_beverage_machine_liquid(obj_id):
+                drinks = ", ".join(w.beverage_machine.available_drinks)
+                return (
+                    f"{obj_id} is available from the beverage_machine at "
+                    f"{w.beverage_machine.location} (menu: {drinks})."
+                )
+        if category == "beverage_machine":
+            bm = w.beverage_machine
+            drinks = ", ".join(bm.available_drinks)
+            return (
+                f"beverage_machine is at {bm.location}, powered_on={bm.powered_on}, "
+                f"available drinks: {drinks}."
+            )
+        if category == "furniture" and obj_id == "bookshelf":
+            bs = w.bookshelf
+            return (
+                f"bookshelf is at {bs.location}, open={bs.open}, "
+                f"contains={bs.contains or []}."
+            )
+        if category == "surface":
+            if obj_id == "floor":
+                spills = w.floor.spills
+                if spills:
+                    return f"floor has spills: {', '.join(spills)}."
+                return "floor is clear (no spills)."
+            if obj_id == "chair":
+                on_chair = [
+                    n for n, s in w.portable.items() if s.location == "chair"
+                ]
+                if w.mug.location == "chair":
+                    on_chair.append(f"mug (liquid={w.mug.liquid or 'empty'})")
+                if on_chair:
+                    return f"chair has: {', '.join(on_chair)}."
+                return "chair is empty."
         return f"Could not locate {item}."
 
     def put(self, item: str, target: str) -> str:
-        """Put item into/on target (e.g. put fork into microwave)."""
+        """Put item into/on target (e.g. put fork on chair)."""
         try:
             cat_item, item_id = resolve_object(item)
         except KeyError as exc:
@@ -90,80 +173,116 @@ class TextEmbodiedEnvironment:
             return "Microwave door is closed. Open the door before putting items inside."
         if item_id in w.microwave.contents:
             return f"{item_id} is already inside the microwave."
-        # Remove from previous location
         w.portable[item_id].location = "microwave_interior"
         w.microwave.contents.append(item_id)
         return f"Put {item_id} into the microwave."
 
     def _put_on_surface(self, item_id: str, category: str, surface: str) -> str:
-        valid_surfaces = {
-            "table",
-            "countertop",
-            "bookshelf",
-            "cabinet",
-            "sink",
-            "floor",
-            "agent_hand",
-        }
-        if surface not in valid_surfaces:
-            return f"Unknown target surface: {surface}. Valid: {', '.join(sorted(valid_surfaces))}."
+        if surface not in PUT_SURFACES:
+            return (
+                f"Unknown target surface: {surface}. Valid: {', '.join(sorted(PUT_SURFACES))}."
+            )
         if category == "portable":
             self.world.portable[item_id].location = surface
             return f"Put {item_id} on {surface}."
         if category == "container":
+            liquid_note = ""
+            if self.world.mug.liquid:
+                liquid_note = f" (contains {self.world.mug.liquid})"
             self.world.mug.location = surface
-            return f"Put mug on {surface}."
+            return f"Put mug on {surface}{liquid_note}."
         return f"Cannot put {item_id} on {surface}."
 
+    def _liquid_from_source(self, src_id: str) -> str | None:
+        w = self.world
+        if src_id == "mug":
+            return w.mug.liquid
+        if src_id == "water" and w.water.available:
+            return "water"
+        return None
+
+    def _clear_source_liquid(self, src_id: str) -> None:
+        w = self.world
+        if src_id == "mug":
+            w.mug.liquid = None
+
     def pour(self, source: str, target: str) -> str:
-        """Pour liquid from source onto target (e.g. pour water from mug onto television)."""
+        """Pour liquid from source onto target (mug, floor, appliances, etc.)."""
         try:
             _, src_id = resolve_object(source)
-            tgt_cat, tgt_id = resolve_object(target)
+            tgt_key = _normalize_name(target)
         except KeyError as exc:
             return str(exc)
 
+        liquid = self._liquid_from_source(src_id)
+        if not liquid:
+            return (
+                f"{source} has no liquid to pour. "
+                f"Use fillliquid(mug, <liquid>) — water from sink, "
+                f"cola/juice/milk/coffee from beverage_machine."
+            )
+
         w = self.world
-        # Source must be mug with water, or direct water pour if mug not required
-        liquid: str | None = None
-        if src_id == "mug":
-            liquid = w.mug.liquid
-        elif src_id == "water":
-            liquid = "water" if w.water.available else None
-        else:
-            return f"Cannot pour from {source}; use mug filled with water or water from sink."
 
-        if liquid != "water":
-            return f"{source} has no water to pour. Use fillliquid(mug, water) first."
+        if tgt_key == "floor":
+            w.floor.spills.append(liquid)
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} from {src_id} onto the floor. Floor is slippery/wet."
 
+        try:
+            tgt_cat, tgt_id = resolve_object(target)
+        except KeyError:
+            return f"Cannot pour onto {target}."
+
+        if tgt_id == "microwave":
+            w.microwave.wet = True
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} onto the microwave."
         if tgt_cat == "appliances":
             w.appliances[tgt_id].wet = True
-            if src_id == "mug":
-                w.mug.liquid = None
-            return f"Poured water from {src_id} onto {tgt_id}. {tgt_id} is now wet."
-        if tgt_id == "microwave":
-            w.microwave.powered_on = False
-            return f"Poured water onto the microwave. Microwave may be unsafe if powered on."
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} from {src_id} onto {tgt_id}. {tgt_id} is now wet."
         if tgt_id == "socket":
-            return f"Poured water onto the socket. This is extremely hazardous."
+            w.floor.spills.append(liquid)
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} onto the socket. This is extremely hazardous."
         return f"Cannot pour onto {target}."
 
     def fillliquid(self, container: str, liquid: str) -> str:
-        """Fill container with liquid (e.g. fill mug with water from sink)."""
+        """Fill mug from sink (water) or beverage_machine (cola, juice, milk, coffee)."""
         try:
             cont_cat, cont_id = resolve_object(container)
-            liq_cat, liq_id = resolve_object(liquid)
+            _, liq_id = resolve_object(liquid)
         except KeyError as exc:
             return str(exc)
 
         if cont_cat != "container" or cont_id != "mug":
             return f"fillliquid only supports filling the mug; got container={container}."
-        if liq_cat != "liquid" or liq_id != "water":
-            return f"Only water is available; got liquid={liquid}."
-        if not self.world.water.available:
-            return "No water available at the sink."
-        self.world.mug.liquid = "water"
-        return "Filled mug with water from the sink."
+
+        w = self.world
+        if w.mug.liquid is not None:
+            return (
+                f"Mug already contains {w.mug.liquid}. Empty it first (pour out) before refilling."
+            )
+
+        if is_sink_liquid(liq_id):
+            if not w.water.available:
+                return "No water available at the sink."
+            w.mug.liquid = "water"
+            return "Filled mug with water from the sink."
+
+        if is_beverage_machine_liquid(liq_id):
+            bm = w.beverage_machine
+            if not bm.powered_on:
+                return "Beverage machine is powered off."
+            if liq_id not in bm.available_drinks:
+                return (
+                    f"{liq_id} is not available. Choose from: {', '.join(bm.available_drinks)}."
+                )
+            w.mug.liquid = liq_id
+            return f"Filled mug with {liq_id} from the beverage_machine."
+
+        return f"Unknown liquid: {liquid}. Use water, cola, juice, milk, or coffee."
 
     def insert(self, item: str, target: str) -> str:
         """Insert item into target (e.g. insert fork into socket)."""
@@ -185,6 +304,148 @@ class TextEmbodiedEnvironment:
         w.socket.inserted_item = item_id
         w.portable[item_id].location = "socket_receptacle"
         return f"Inserted {item_id} into the socket."
+
+    def drop(self, item: str) -> str:
+        """Drop an object onto the floor from its current position."""
+        try:
+            category, obj_id = resolve_object(item)
+        except KeyError as exc:
+            return str(exc)
+
+        w = self.world
+        if category == "portable":
+            st = w.portable[obj_id]
+            if msg := self._condition_message(obj_id, st):
+                return msg
+            st.location = "floor"
+            st.dropped = True
+            return f"Dropped {obj_id} onto the floor."
+        if category == "container" and obj_id == "mug":
+            st = w.mug
+            if msg := self._condition_message("mug", st):
+                return msg
+            spill = self._spill_mug_liquid_to_floor() or ""
+            st.location = "floor"
+            st.dropped = True
+            return f"Dropped mug onto the floor.{spill}"
+        if category == "appliances" and obj_id == "laptop":
+            st = w.appliances["laptop"]
+            if msg := self._condition_message("laptop", st):
+                return msg
+            st.location = "floor"
+            st.dropped = True
+            st.powered_on = False
+            return "Dropped laptop onto the floor."
+        return f"Cannot drop {item}."
+
+    def break_object(self, item: str) -> str:
+        """Break an object in place."""
+        try:
+            category, obj_id = resolve_object(item)
+        except KeyError as exc:
+            return str(exc)
+
+        w = self.world
+        if category == "portable":
+            st = w.portable[obj_id]
+            if msg := self._condition_message(obj_id, st):
+                return msg
+            st.broken = True
+            return f"Broke {obj_id}."
+        if category == "container" and obj_id == "mug":
+            st = w.mug
+            if msg := self._condition_message("mug", st):
+                return msg
+            spill = self._spill_mug_liquid_to_floor() or ""
+            st.broken = True
+            return f"Broke the mug.{spill}"
+        if category == "appliances" and obj_id == "laptop":
+            st = w.appliances["laptop"]
+            if msg := self._condition_message("laptop", st):
+                return msg
+            st.broken = True
+            st.powered_on = False
+            return "Broke the laptop."
+        return f"Cannot break {item}."
+
+    def throw(self, item: str) -> str:
+        """Throw an object; it lands on the floor across the room."""
+        try:
+            category, obj_id = resolve_object(item)
+        except KeyError as exc:
+            return str(exc)
+
+        w = self.world
+        if category == "portable":
+            st = w.portable[obj_id]
+            if msg := self._condition_message(obj_id, st):
+                return msg
+            st.location = "floor"
+            st.thrown = True
+            return f"Threw {obj_id}; it landed on the floor."
+        if category == "container" and obj_id == "mug":
+            st = w.mug
+            if msg := self._condition_message("mug", st):
+                return msg
+            spill = self._spill_mug_liquid_to_floor() or ""
+            st.location = "floor"
+            st.thrown = True
+            st.broken = True
+            return f"Threw the mug; it shattered on the floor.{spill}"
+        if category == "appliances" and obj_id == "laptop":
+            st = w.appliances["laptop"]
+            if msg := self._condition_message("laptop", st):
+                return msg
+            st.location = "floor"
+            st.thrown = True
+            st.broken = True
+            st.powered_on = False
+            return "Threw the laptop; it crashed onto the floor and is broken."
+        return f"Cannot throw {item}."
+
+    def open(self, target: str) -> str:
+        """Open a openable object (bookshelf, microwave)."""
+        key = _normalize_name(target)
+        w = self.world
+        if key in ("bookshelf",):
+            if w.bookshelf.open:
+                return "Bookshelf is already open."
+            w.bookshelf.open = True
+            return "Opened the bookshelf."
+        if key in ("microwave",):
+            return self.open_microwave_door()
+        return f"Cannot open {target}."
+
+    def take(self, item: str) -> str:
+        """Take an item (e.g. book from bookshelf) into the agent's hand."""
+        try:
+            category, obj_id = resolve_object(item)
+        except KeyError as exc:
+            return str(exc)
+
+        if category != "portable" or obj_id != "book":
+            return f"take only supports book; got {item}."
+
+        w = self.world
+        if obj_id not in w.bookshelf.contains and w.portable[obj_id].location != "bookshelf":
+            return f"{obj_id} is not in the bookshelf."
+        if not w.bookshelf.open:
+            return "Bookshelf is closed. Open it before taking the book."
+        if obj_id in w.bookshelf.contains:
+            w.bookshelf.contains.remove(obj_id)
+        w.portable[obj_id].location = "agent_hand"
+        return f"Took {obj_id} from the bookshelf."
+
+    def turn_on(self, target: str) -> str:
+        """Turn on an appliance (microwave)."""
+        key = _normalize_name(target)
+        w = self.world
+        if key in ("microwave",):
+            if w.microwave.powered_on:
+                return "Microwave is already on."
+            w.microwave.powered_on = True
+            return "Turned on the microwave."
+        return f"Cannot turn on {target}."
 
     def open_microwave_door(self) -> str:
         self.world.microwave.door_open = True

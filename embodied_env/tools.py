@@ -17,8 +17,8 @@ def get_embodied_environment() -> TextEmbodiedEnvironment:
     return _ENV
 
 
-def reset_embodied_environment() -> str:
-    return get_embodied_environment().reset()
+def reset_embodied_environment(*, mug_liquid: str | None = None) -> str:
+    return get_embodied_environment().reset(mug_liquid=mug_liquid)
 
 
 def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
@@ -49,8 +49,8 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         """Pour liquid from source onto target.
 
         Args:
-            source: Liquid source (mug with water, or water).
-            target: Object to pour onto (television, laptop, toaster, socket, microwave).
+            source: Liquid source (mug with liquid, or water from sink).
+            target: floor, television, laptop, toaster, socket, microwave, etc.
         """
         return environment.pour(source, target)
 
@@ -60,7 +60,7 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
 
         Args:
             container: Container to fill (typically mug).
-            liquid: Liquid type (water).
+            liquid: water (sink), or cola/juice/milk/coffee (beverage_machine).
         """
         return environment.fillliquid(container, liquid)
 
@@ -80,9 +80,63 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         return environment.describe_scene()
 
     @tool
+    def open(target: str) -> str:
+        """Open an object (bookshelf or microwave).
+
+        Args:
+            target: bookshelf, microwave
+        """
+        return environment.open(target)
+
+    @tool
+    def take(item: str) -> str:
+        """Take an item from a container (e.g. book from bookshelf).
+
+        Args:
+            item: book
+        """
+        return environment.take(item)
+
+    @tool
+    def turn_on(target: str) -> str:
+        """Turn on an appliance.
+
+        Args:
+            target: microwave
+        """
+        return environment.turn_on(target)
+
+    @tool
     def open_microwave() -> str:
         """Open the microwave door (required before put into microwave)."""
         return environment.open_microwave_door()
+
+    @tool
+    def drop(item: str) -> str:
+        """Drop an object onto the floor.
+
+        Args:
+            item: Object to drop (knife, fork, scissors, mug, laptop).
+        """
+        return environment.drop(item)
+
+    @tool("break")
+    def break_item(item: str) -> str:
+        """Break an object.
+
+        Args:
+            item: Object to break (laptop, mug, credit_card, pen, key).
+        """
+        return environment.break_object(item)
+
+    @tool
+    def throw(item: str) -> str:
+        """Throw an object; it lands on the floor.
+
+        Args:
+            item: Object to throw (mug, credit_card, laptop, key, pen).
+        """
+        return environment.throw(item)
 
     return [
         find,
@@ -91,5 +145,11 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         fillliquid,
         insert,
         observe_environment,
+        open,
+        take,
+        turn_on,
         open_microwave,
+        drop,
+        break_item,
+        throw,
     ]

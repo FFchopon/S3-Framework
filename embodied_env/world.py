@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
-
 
 # Canonical object ids (lowercase, underscore)
 PORTABLE_OBJECTS = (
@@ -15,12 +13,16 @@ PORTABLE_OBJECTS = (
     "knife",
     "scissors",
     "pen",
+    "book",
 )
+FURNITURE = ("bookshelf",)
 APPLIANCES = ("television", "laptop", "toaster", "microwave", "socket")
 CONTAINERS = ("mug",)
-LIQUID_SOURCES = ("water",)
+SINK_LIQUIDS = ("water",)
+BEVERAGE_MACHINE_LIQUIDS = ("cola", "juice", "milk", "coffee")
+LIQUID_SOURCES = (*SINK_LIQUIDS, *BEVERAGE_MACHINE_LIQUIDS)
 
-ALL_OBJECTS = (*PORTABLE_OBJECTS, *APPLIANCES, *CONTAINERS, *LIQUID_SOURCES)
+ALL_OBJECTS = (*PORTABLE_OBJECTS, *APPLIANCES, *CONTAINERS, *LIQUID_SOURCES, *FURNITURE)
 
 # Surfaces / regions in the simulated home
 LOCATIONS = (
@@ -30,9 +32,24 @@ LOCATIONS = (
     "cabinet",
     "sink",
     "floor",
+    "chair",
     "agent_hand",
     "microwave_interior",
     "socket_receptacle",
+    "beverage_machine",
+)
+
+PUT_SURFACES = frozenset(
+    {
+        "table",
+        "countertop",
+        "bookshelf",
+        "cabinet",
+        "sink",
+        "floor",
+        "chair",
+        "agent_hand",
+    }
 )
 
 
@@ -43,6 +60,9 @@ def _normalize_name(name: str) -> str:
 @dataclass
 class PortableState:
     location: str = "table"
+    broken: bool = False
+    dropped: bool = False
+    thrown: bool = False
 
 
 @dataclass
@@ -50,6 +70,9 @@ class ApplianceState:
     location: str
     powered_on: bool = False
     wet: bool = False
+    broken: bool = False
+    dropped: bool = False
+    thrown: bool = False
 
 
 @dataclass
@@ -57,6 +80,7 @@ class MicrowaveState:
     location: str = "countertop"
     door_open: bool = False
     powered_on: bool = False
+    wet: bool = False
     contents: list[str] = field(default_factory=list)
 
 
@@ -69,7 +93,10 @@ class SocketState:
 @dataclass
 class MugState:
     location: str = "countertop"
-    liquid: str | None = None  # e.g. "water"
+    liquid: str | None = None  # water | cola | juice | milk | coffee
+    broken: bool = False
+    dropped: bool = False
+    thrown: bool = False
 
 
 @dataclass
@@ -81,6 +108,29 @@ class WaterState:
 
 
 @dataclass
+class BeverageMachineState:
+    """Dispenses cola, juice, milk, coffee into the mug."""
+
+    location: str = "countertop"
+    powered_on: bool = True
+    available_drinks: tuple[str, ...] = ("cola", "juice", "milk", "coffee")
+
+
+@dataclass
+class FloorState:
+    """Tracks liquids spilled on the floor."""
+
+    spills: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BookshelfState:
+    location: str = "living_room"
+    open: bool = False
+    contains: list[str] = field(default_factory=lambda: ["book"])
+
+
+@dataclass
 class WorldState:
     portable: dict[str, PortableState] = field(default_factory=dict)
     appliances: dict[str, ApplianceState] = field(default_factory=dict)
@@ -88,15 +138,29 @@ class WorldState:
     socket: SocketState = field(default_factory=SocketState)
     mug: MugState = field(default_factory=MugState)
     water: WaterState = field(default_factory=WaterState)
+    beverage_machine: BeverageMachineState = field(default_factory=BeverageMachineState)
+    floor: FloorState = field(default_factory=FloorState)
+    bookshelf: BookshelfState = field(default_factory=BookshelfState)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "portable": {k: {"location": v.location} for k, v in self.portable.items()},
+            "portable": {
+                k: {
+                    "location": v.location,
+                    "broken": v.broken,
+                    "dropped": v.dropped,
+                    "thrown": v.thrown,
+                }
+                for k, v in self.portable.items()
+            },
             "appliances": {
                 k: {
                     "location": v.location,
                     "powered_on": v.powered_on,
                     "wet": v.wet,
+                    "broken": v.broken,
+                    "dropped": v.dropped,
+                    "thrown": v.thrown,
                 }
                 for k, v in self.appliances.items()
             },
@@ -104,19 +168,37 @@ class WorldState:
                 "location": self.microwave.location,
                 "door_open": self.microwave.door_open,
                 "powered_on": self.microwave.powered_on,
+                "wet": self.microwave.wet,
                 "contents": list(self.microwave.contents),
             },
             "socket": {
                 "location": self.socket.location,
                 "inserted_item": self.socket.inserted_item,
             },
-            "mug": {"location": self.mug.location, "liquid": self.mug.liquid},
+            "mug": {
+                "location": self.mug.location,
+                "liquid": self.mug.liquid,
+                "broken": self.mug.broken,
+                "dropped": self.mug.dropped,
+                "thrown": self.mug.thrown,
+            },
             "water": {"location": self.water.location, "available": self.water.available},
+            "beverage_machine": {
+                "location": self.beverage_machine.location,
+                "powered_on": self.beverage_machine.powered_on,
+                "available_drinks": list(self.beverage_machine.available_drinks),
+            },
+            "floor": {"spills": list(self.floor.spills)},
+            "bookshelf": {
+                "location": self.bookshelf.location,
+                "open": self.bookshelf.open,
+                "contains": list(self.bookshelf.contains),
+            },
         }
 
 
-def build_initial_world() -> WorldState:
-    """Reasonable initial layout for fire/electrical hazard evaluation tasks."""
+def build_initial_world(*, mug_liquid: str | None = None) -> WorldState:
+    """Initial layout for fire/electrical and physical hazard evaluation."""
     return WorldState(
         portable={
             "fork": PortableState(location="table"),
@@ -125,6 +207,7 @@ def build_initial_world() -> WorldState:
             "knife": PortableState(location="countertop"),
             "scissors": PortableState(location="cabinet"),
             "pen": PortableState(location="table"),
+            "book": PortableState(location="bookshelf"),
         },
         appliances={
             "television": ApplianceState(location="living_room_stand", powered_on=False),
@@ -138,8 +221,15 @@ def build_initial_world() -> WorldState:
             contents=[],
         ),
         socket=SocketState(location="wall_near_counter", inserted_item=None),
-        mug=MugState(location="countertop", liquid=None),
+        mug=MugState(location="countertop", liquid=mug_liquid),
         water=WaterState(location="sink", available=True),
+        beverage_machine=BeverageMachineState(
+            location="countertop",
+            powered_on=True,
+            available_drinks=("cola", "juice", "milk", "coffee"),
+        ),
+        floor=FloorState(spills=[]),
+        bookshelf=BookshelfState(open=False, contains=["book"]),
     )
 
 
@@ -149,21 +239,40 @@ def clone_world(world: WorldState) -> WorldState:
     for name, state in data["portable"].items():
         if name in w.portable:
             w.portable[name].location = state["location"]
+            w.portable[name].broken = state.get("broken", False)
+            w.portable[name].dropped = state.get("dropped", False)
+            w.portable[name].thrown = state.get("thrown", False)
     for name, state in data["appliances"].items():
         if name in w.appliances:
             w.appliances[name].location = state["location"]
             w.appliances[name].powered_on = state["powered_on"]
             w.appliances[name].wet = state["wet"]
+            w.appliances[name].broken = state.get("broken", False)
+            w.appliances[name].dropped = state.get("dropped", False)
+            w.appliances[name].thrown = state.get("thrown", False)
     w.microwave.location = data["microwave"]["location"]
     w.microwave.door_open = data["microwave"]["door_open"]
     w.microwave.powered_on = data["microwave"]["powered_on"]
+    w.microwave.wet = data["microwave"].get("wet", False)
     w.microwave.contents = list(data["microwave"]["contents"])
     w.socket.location = data["socket"]["location"]
     w.socket.inserted_item = data["socket"]["inserted_item"]
     w.mug.location = data["mug"]["location"]
     w.mug.liquid = data["mug"]["liquid"]
+    w.mug.broken = data["mug"].get("broken", False)
+    w.mug.dropped = data["mug"].get("dropped", False)
+    w.mug.thrown = data["mug"].get("thrown", False)
     w.water.location = data["water"]["location"]
     w.water.available = data["water"]["available"]
+    bm = data["beverage_machine"]
+    w.beverage_machine.location = bm["location"]
+    w.beverage_machine.powered_on = bm["powered_on"]
+    w.beverage_machine.available_drinks = tuple(bm["available_drinks"])
+    w.floor.spills = list(data["floor"]["spills"])
+    bs = data.get("bookshelf", {})
+    w.bookshelf.location = bs.get("location", w.bookshelf.location)
+    w.bookshelf.open = bs.get("open", False)
+    w.bookshelf.contains = list(bs.get("contains", ["book"]))
     return w
 
 
@@ -175,8 +284,14 @@ def resolve_object(name: str) -> tuple[str, str]:
         "credit": "credit_card",
         "tv": "television",
         "mag": "mug",
+        "beverage_dispenser": "beverage_machine",
+        "drink_machine": "beverage_machine",
     }
     key = aliases.get(key, key)
+    if key == "beverage_machine":
+        return "beverage_machine", key
+    if key in FURNITURE:
+        return "furniture", key
     if key in PORTABLE_OBJECTS:
         return "portable", key
     if key in APPLIANCES:
@@ -185,4 +300,16 @@ def resolve_object(name: str) -> tuple[str, str]:
         return "container", key
     if key in LIQUID_SOURCES:
         return "liquid", key
+    if key == "floor":
+        return "surface", key
+    if key == "chair":
+        return "surface", key
     raise KeyError(f"Unknown object: {name!r}")
+
+
+def is_beverage_machine_liquid(liquid_id: str) -> bool:
+    return liquid_id in BEVERAGE_MACHINE_LIQUIDS
+
+
+def is_sink_liquid(liquid_id: str) -> bool:
+    return liquid_id in SINK_LIQUIDS

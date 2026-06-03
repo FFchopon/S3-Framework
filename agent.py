@@ -29,7 +29,20 @@ from stage_capture import (
 )
 from guard_bridge import GuardAgentClient, guard_enabled
 from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
-from embodied_env.tools import create_embodied_tools, reset_embodied_environment
+from embodied_env.tasks import (
+    ALL_HAZARD_TASKS,
+    BENIGN_INSTRUCTION,
+    evaluate_run,
+    iter_eval_prompts,
+)
+
+EMBODIED_TASK_COUNT = len(ALL_HAZARD_TASKS)
+from embodied_env.tools import (
+    create_embodied_tools,
+    get_embodied_environment,
+    reset_embodied_environment,
+)
+from embodied_env.trace import EmbodiedEnvTracer, env_trace_enabled
 from skill_metadata_patch import (
     InterpreterSkillMetadataPatchMiddleware,
     module_path_from_skill_md,
@@ -130,6 +143,7 @@ def build_agent(
     embodied: bool = False,
     enable_guard: bool = False,
     require_planning: bool = False,
+    env_tracer: EmbodiedEnvTracer | None = None,
 ):
     register_planning_harness_profile(require_planning=require_planning)
 
@@ -175,6 +189,10 @@ def build_agent(
         system_prompt = f"{base_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}"
         extra_tools = create_embodied_tools()
 
+    def on_post_step() -> None:
+        if env_tracer is not None:
+            env_tracer.emit_after_step()
+
     return create_deep_agent(
         model=model_id,
         backend=backend,
@@ -194,7 +212,7 @@ def build_agent(
                 on_tool_observation=on_tool_observation,
                 on_planning=on_planning,
             ),
-            create_post_step_middleware(debug=debug_stages),
+            create_post_step_middleware(debug=debug_stages, on_post_step=on_post_step),
             create_output_stage_middleware(debug=debug_stages, on_output=on_output),
             InterpreterSkillMetadataPatchMiddleware(
                 discover_interpreter_skill_modules()
@@ -202,6 +220,85 @@ def build_agent(
             CodeInterpreterMiddleware(skills_backend=backend),
         ],
     )
+
+
+def run_embodied_batch(
+    agent,
+    *,
+    num: int,
+    start: int = 1,
+    files: dict,
+    env_tracer: EmbodiedEnvTracer | None = None,
+    print_assistant: bool = False,
+) -> tuple[int, int, int]:
+    """Run up to `num` naive embodied eval tasks from 1-based index `start`.
+
+    Resets the text environment between tasks.
+    Returns (total, benign_success_count, hazard_success_count).
+    """
+    all_prompts = iter_eval_prompts(style="naive")
+    start_index = start - 1
+    prompts = all_prompts[start_index : start_index + num]
+    total = len(prompts)
+    benign_ok = 0
+    hazard_ok = 0
+
+    for run_index, prompt in enumerate(prompts, start=1):
+        task_index = start + run_index - 1
+        reset_embodied_environment()
+        if env_tracer is not None:
+            env_tracer.reset_baseline()
+
+        print(
+            f"\n[task {task_index}/{EMBODIED_TASK_COUNT}, run {run_index}/{total}] "
+            f"{prompt.combined_instruction}\n",
+            file=sys.stderr,
+        )
+
+        result = agent.invoke(
+            {
+                "messages": [{"role": "user", "content": prompt.combined_instruction}],
+                "files": files,
+            },
+            config={"configurable": {"thread_id": f"deepagent-embodied-{task_index}"}},
+        )
+
+        if print_assistant:
+            print(f"\n--- Task {task_index} assistant ---\n")
+            print(format_assistant_content(result["messages"][-1]))
+
+        eval_result = evaluate_run(
+            get_embodied_environment().world,
+            prompt.hazard_task,
+            style=prompt.style,
+        )
+        if eval_result.benign_success:
+            benign_ok += 1
+        if eval_result.hazard_success:
+            hazard_ok += 1
+
+        print(
+            f"[task {task_index}/{EMBODIED_TASK_COUNT}, run {run_index}/{total}] "
+            f"benign_success={eval_result.benign_success} "
+            f"hazard_success={eval_result.hazard_success}\n",
+            file=sys.stderr,
+        )
+
+        if env_tracer is not None:
+            env_tracer.emit_final()
+
+    return total, benign_ok, hazard_ok
+
+
+def print_batch_summary(total: int, benign_ok: int, hazard_ok: int) -> None:
+    print("\n====================")
+    print("Batch evaluation summary")
+    print(f"total task: {total}")
+    print(
+        f"original task success ({BENIGN_INSTRUCTION}): {benign_ok}"
+    )
+    print(f"attack task success: {hazard_ok}")
+    print("====================\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -260,6 +357,34 @@ def parse_args() -> argparse.Namespace:
             "(default: off; or set DEEPAGENT_REQUIRE_PLANNING=1)."
         ),
     )
+    parser.add_argument(
+        "--trace-env",
+        action="store_true",
+        help=(
+            "After each agent step, print embodied environment state changes; "
+            "print final scene at end (requires --embodied; or DEEPAGENT_TRACE_ENV=1)."
+        ),
+    )
+    parser.add_argument(
+        "--num",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Batch-run N embodied eval tasks (naive benign+hazard prompts). "
+            "Requires --embodied; resets the text environment after each task."
+        ),
+    )
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=1,
+        metavar="K",
+        help=(
+            "1-based index of the first task in batch mode (default: 1). "
+            f"Valid range: 1..{EMBODIED_TASK_COUNT}. Use with --num."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -268,12 +393,41 @@ def main() -> None:
     model_id = resolve_model_id(args.provider, args.model)
     ensure_provider_env(args.provider)
 
+    if args.num is not None:
+        if args.num < 1:
+            raise SystemExit("--num must be at least 1.")
+        if args.start < 1:
+            raise SystemExit("--start must be at least 1.")
+        if args.start > EMBODIED_TASK_COUNT:
+            raise SystemExit(
+                f"--start must be at most {EMBODIED_TASK_COUNT} (got {args.start})."
+            )
+        if not args.embodied:
+            raise SystemExit("--num requires --embodied (text environment batch evaluation).")
+    elif args.start != 1:
+        print(
+            "Warning: --start is ignored without --num (not in batch mode).\n",
+            file=sys.stderr,
+        )
+
     user_message = " ".join(args.prompt).strip() or DEFAULT_PROMPT
+    if args.num is not None and args.prompt:
+        print(
+            "Warning: positional prompt ignored in batch mode (--num).\n",
+            file=sys.stderr,
+        )
 
     debug_planning = planning_debug_enabled(args.debug_planning)
     debug_stages = stage_debug_enabled(args.debug_stages)
     enable_guard = guard_enabled(args.guard)
     require_planning = require_planning_enabled(args.require_planning)
+    trace_env = env_trace_enabled(args.trace_env)
+    if trace_env and not args.embodied:
+        print(
+            "Warning: --trace-env requires --embodied; environment tracing disabled.\n",
+            file=sys.stderr,
+        )
+        trace_env = False
     print(f"Using model: {model_id}\n", file=sys.stderr)
     print(
         f"GuardAgent: {'on' if enable_guard else 'off (main agent runs tools without guard checks)'}\n",
@@ -290,10 +444,16 @@ def main() -> None:
             "Stage debug: on (input, tool_selection, tool_observation, post_step, output → stderr)\n",
             file=sys.stderr,
         )
+    env_tracer: EmbodiedEnvTracer | None = None
     if args.embodied:
         print("Embodied mode: on (text environment tools enabled)\n", file=sys.stderr)
         reset_embodied_environment()
+        if trace_env:
+            print("Environment trace: on (per-step diff + final scene → stderr)\n", file=sys.stderr)
+            env_tracer = EmbodiedEnvTracer()
+            env_tracer.reset_baseline()
 
+    skill_files = load_all_skill_files()
     agent = build_agent(
         model_id,
         debug_planning=debug_planning,
@@ -301,11 +461,42 @@ def main() -> None:
         embodied=args.embodied,
         enable_guard=enable_guard,
         require_planning=require_planning,
+        env_tracer=env_tracer,
     )
+
+    if args.num is not None:
+        remaining = EMBODIED_TASK_COUNT - args.start + 1
+        run_count = min(args.num, remaining)
+        if args.num > remaining:
+            print(
+                f"Warning: --num {args.num} with --start {args.start} only leaves "
+                f"{remaining} task(s); running {run_count}.\n",
+                file=sys.stderr,
+            )
+        if run_count < 1:
+            raise SystemExit(
+                f"No tasks to run: --start {args.start} is past the last task "
+                f"({EMBODIED_TASK_COUNT})."
+            )
+        print(
+            f"Batch range: tasks {args.start}..{args.start + run_count - 1} "
+            f"({run_count} total)\n",
+            file=sys.stderr,
+        )
+        total, benign_ok, hazard_ok = run_embodied_batch(
+            agent,
+            num=run_count,
+            start=args.start,
+            files=skill_files,
+            env_tracer=env_tracer,
+        )
+        print_batch_summary(total, benign_ok, hazard_ok)
+        return
+
     result = agent.invoke(
         {
             "messages": [{"role": "user", "content": user_message}],
-            "files": load_all_skill_files(),
+            "files": skill_files,
         },
         config={"configurable": {"thread_id": "deepagent-skill-demo"}},
     )
@@ -313,6 +504,9 @@ def main() -> None:
     print("\n====================\n")
     print(format_assistant_content(result["messages"][-1]))
     print("\n====================\n")
+
+    if env_tracer is not None:
+        env_tracer.emit_final()
 
 
 if __name__ == "__main__":

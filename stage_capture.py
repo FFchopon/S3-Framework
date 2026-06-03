@@ -340,13 +340,22 @@ def create_input_stage_middleware(
     return InputStageMiddleware(debug=debug, on_input=on_input)
 
 
+OnPostStepCallback = Callable[[], None]
+
+
 class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
     """Fire after tool observation, before the next model call (end of one tool loop)."""
 
     state_schema = StageCaptureState
 
-    def __init__(self, *, debug: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        debug: bool = False,
+        on_post_step: OnPostStepCallback | None = None,
+    ) -> None:
         self._debug = debug
+        self._on_post_step = on_post_step
 
     def before_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -358,6 +367,9 @@ class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if self._debug:
             emit_post_step_marker()
 
+        if self._on_post_step is not None:
+            self._on_post_step()
+
         event: StageEvent = {"stage": STAGE_POST_STEP}
         prior = list(state.get("stage_events") or [])
         return {"stage_events": [*prior, event]}
@@ -368,8 +380,12 @@ class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         return self.before_model(state, runtime)
 
 
-def create_post_step_middleware(*, debug: bool = False) -> PostStepStageMiddleware:
-    return PostStepStageMiddleware(debug=debug)
+def create_post_step_middleware(
+    *,
+    debug: bool = False,
+    on_post_step: OnPostStepCallback | None = None,
+) -> PostStepStageMiddleware:
+    return PostStepStageMiddleware(debug=debug, on_post_step=on_post_step)
 
 
 class OutputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):

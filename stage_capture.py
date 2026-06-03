@@ -25,6 +25,9 @@ STAGE_TOOL_OBSERVATION = "tool_observation"
 STAGE_POST_STEP = "post_step"
 STAGE_INPUT = "input"
 STAGE_OUTPUT = "output"
+STAGE_PLANNING = "planning"
+
+WRITE_TODOS_TOOL_NAME = "write_todos"
 
 
 class ToolCallPlan(TypedDict):
@@ -43,6 +46,7 @@ class StageEvent(TypedDict):
     stage: str
     user_input: NotRequired[str]
     model_output: NotRequired[str]
+    planning_todos: NotRequired[Any]
     tool_calls: NotRequired[list[ToolCallPlan]]
     observations: NotRequired[list[ToolObservationRecord]]
 
@@ -55,6 +59,7 @@ class StageCaptureState(AgentState):
     last_tool_selection: NotRequired[list[ToolCallPlan]]
     last_tool_observations: NotRequired[list[ToolObservationRecord]]
     stage_events: NotRequired[list[StageEvent]]
+    guard_checks: NotRequired[dict[str, Any]]
 
 
 def stage_debug_enabled(cli_flag: bool = False) -> bool:
@@ -182,6 +187,9 @@ def is_completed_tool_step(messages: list[AnyMessage]) -> bool:
 
 OnToolSelectionCallback = Callable[[list[ToolCallPlan]], None]
 OnToolObservationCallback = Callable[[list[ToolObservationRecord]], None]
+OnInputCallback = Callable[[str], None]
+OnOutputCallback = Callable[[str], None]
+OnPlanningCallback = Callable[[Any], None]
 
 
 class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
@@ -195,10 +203,12 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         debug: bool = False,
         on_tool_selection: OnToolSelectionCallback | None = None,
         on_tool_observation: OnToolObservationCallback | None = None,
+        on_planning: OnPlanningCallback | None = None,
     ) -> None:
         self._debug = debug
         self._on_tool_selection = on_tool_selection
         self._on_tool_observation = on_tool_observation
+        self._on_planning = on_planning
 
     def after_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -213,6 +223,15 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
 
         if self._on_tool_selection is not None:
             self._on_tool_selection(pending)
+
+        # planning: write_todos tool call args contain the natural-language plan todos
+        if self._on_planning is not None:
+            for call in pending:
+                if call.get("name") == WRITE_TODOS_TOOL_NAME:
+                    todos = (call.get("args") or {}).get("todos")
+                    if todos is not None:
+                        self._on_planning(todos)
+                    break
 
         event: StageEvent = {
             "stage": STAGE_TOOL_SELECTION,
@@ -264,11 +283,13 @@ def create_stage_capture_middleware(
     debug: bool = False,
     on_tool_selection: OnToolSelectionCallback | None = None,
     on_tool_observation: OnToolObservationCallback | None = None,
+    on_planning: OnPlanningCallback | None = None,
 ) -> MainStageCaptureMiddleware:
     return MainStageCaptureMiddleware(
         debug=debug,
         on_tool_selection=on_tool_selection,
         on_tool_observation=on_tool_observation,
+        on_planning=on_planning,
     )
 
 
@@ -277,8 +298,9 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
 
     state_schema = StageCaptureState
 
-    def __init__(self, *, debug: bool = False) -> None:
+    def __init__(self, *, debug: bool = False, on_input: OnInputCallback | None = None) -> None:
         self._debug = debug
+        self._on_input = on_input
 
     def before_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -292,6 +314,9 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
 
         if self._debug:
             emit_stage_debug(STAGE_INPUT, {"user_input": user_input})
+
+        if self._on_input is not None:
+            self._on_input(user_input)
 
         event: StageEvent = {
             "stage": STAGE_INPUT,
@@ -309,8 +334,10 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         return self.before_model(state, runtime)
 
 
-def create_input_stage_middleware(*, debug: bool = False) -> InputStageMiddleware:
-    return InputStageMiddleware(debug=debug)
+def create_input_stage_middleware(
+    *, debug: bool = False, on_input: OnInputCallback | None = None
+) -> InputStageMiddleware:
+    return InputStageMiddleware(debug=debug, on_input=on_input)
 
 
 class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
@@ -350,8 +377,9 @@ class OutputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
 
     state_schema = StageCaptureState
 
-    def __init__(self, *, debug: bool = False) -> None:
+    def __init__(self, *, debug: bool = False, on_output: OnOutputCallback | None = None) -> None:
         self._debug = debug
+        self._on_output = on_output
 
     def after_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -365,6 +393,9 @@ class OutputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
 
         if self._debug:
             emit_stage_debug(STAGE_OUTPUT, {"model_output": model_output})
+
+        if self._on_output is not None:
+            self._on_output(model_output)
 
         event: StageEvent = {
             "stage": STAGE_OUTPUT,
@@ -382,5 +413,7 @@ class OutputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         return self.after_model(state, runtime)
 
 
-def create_output_stage_middleware(*, debug: bool = False) -> OutputStageMiddleware:
-    return OutputStageMiddleware(debug=debug)
+def create_output_stage_middleware(
+    *, debug: bool = False, on_output: OnOutputCallback | None = None
+) -> OutputStageMiddleware:
+    return OutputStageMiddleware(debug=debug, on_output=on_output)

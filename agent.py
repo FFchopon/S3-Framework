@@ -13,10 +13,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_quickjs import CodeInterpreterMiddleware
 
 from planning import (
+    MINIMAL_SYSTEM_PROMPT,
     PLANNING_WORKFLOW_SYSTEM_PROMPT,
     build_planning_middleware,
     planning_debug_enabled,
     register_planning_harness_profile,
+    require_planning_enabled,
 )
 from stage_capture import (
     create_input_stage_middleware,
@@ -25,6 +27,9 @@ from stage_capture import (
     create_stage_capture_middleware,
     stage_debug_enabled,
 )
+from guard_bridge import GuardAgentClient, guard_enabled
+from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
+from embodied_env.tools import create_embodied_tools, reset_embodied_environment
 from skill_metadata_patch import (
     InterpreterSkillMetadataPatchMiddleware,
     module_path_from_skill_md,
@@ -122,20 +127,75 @@ def build_agent(
     *,
     debug_planning: bool = False,
     debug_stages: bool = False,
+    embodied: bool = False,
+    enable_guard: bool = False,
+    require_planning: bool = False,
 ):
-    register_planning_harness_profile()
+    register_planning_harness_profile(require_planning=require_planning)
+
+    on_input = None
+    on_planning = None
+    on_tool_selection = None
+    on_tool_observation = None
+    on_output = None
+
+    if enable_guard:
+        guard = GuardAgentClient(model_id=model_id)
+
+        def _guard_check(stage: str, payload: object) -> None:
+            result = guard.check(stage, payload)
+            if debug_stages:
+                print(f"\n[guard:{stage}]\n{result.content}\n", file=sys.stderr)
+
+        def on_input(user_input: str) -> None:
+            _guard_check("input", user_input)
+
+        def on_planning(todos: object) -> None:
+            _guard_check("planning", todos)
+
+        def on_tool_selection(tool_calls: list[dict]) -> None:
+            _guard_check("tool_selection", tool_calls)
+
+        def on_tool_observation(observations: list[dict]) -> None:
+            if len(observations) == 1 and isinstance(observations[0].get("content"), str):
+                payload: object = observations[0]["content"]
+            else:
+                payload = observations
+            _guard_check("tool_observation", payload)
+
+        def on_output(model_output: str) -> None:
+            _guard_check("output", model_output)
+
+    base_prompt = (
+        PLANNING_WORKFLOW_SYSTEM_PROMPT if require_planning else MINIMAL_SYSTEM_PROMPT
+    )
+    system_prompt = base_prompt
+    extra_tools: list = []
+    if embodied:
+        system_prompt = f"{base_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}"
+        extra_tools = create_embodied_tools()
+
     return create_deep_agent(
         model=model_id,
         backend=backend,
         skills=["/skills/"],
         checkpointer=checkpointer,
-        system_prompt=PLANNING_WORKFLOW_SYSTEM_PROMPT,
+        tools=extra_tools or None,
+        system_prompt=system_prompt,
         middleware=[
-            *build_planning_middleware(debug_planning=debug_planning),
-            create_input_stage_middleware(debug=debug_stages),
-            create_stage_capture_middleware(debug=debug_stages),
+            *build_planning_middleware(
+                debug_planning=debug_planning,
+                require_planning=require_planning,
+            ),
+            create_input_stage_middleware(debug=debug_stages, on_input=on_input),
+            create_stage_capture_middleware(
+                debug=debug_stages,
+                on_tool_selection=on_tool_selection,
+                on_tool_observation=on_tool_observation,
+                on_planning=on_planning,
+            ),
             create_post_step_middleware(debug=debug_stages),
-            create_output_stage_middleware(debug=debug_stages),
+            create_output_stage_middleware(debug=debug_stages, on_output=on_output),
             InterpreterSkillMetadataPatchMiddleware(
                 discover_interpreter_skill_modules()
             ),
@@ -182,6 +242,24 @@ def parse_args() -> argparse.Namespace:
             "(or set DEEPAGENT_DEBUG_STAGES=1)."
         ),
     )
+    parser.add_argument(
+        "--embodied",
+        action="store_true",
+        help="Enable text-simulated embodied environment tools (find, put, pour, fillliquid, insert).",
+    )
+    parser.add_argument(
+        "--guard",
+        action="store_true",
+        help="Enable GuardAgent stage checks (default: off; or set DEEPAGENT_ENABLE_GUARD=1).",
+    )
+    parser.add_argument(
+        "--require-planning",
+        action="store_true",
+        help=(
+            "Force write_todos planning before other tools "
+            "(default: off; or set DEEPAGENT_REQUIRE_PLANNING=1)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -194,19 +272,35 @@ def main() -> None:
 
     debug_planning = planning_debug_enabled(args.debug_planning)
     debug_stages = stage_debug_enabled(args.debug_stages)
+    enable_guard = guard_enabled(args.guard)
+    require_planning = require_planning_enabled(args.require_planning)
     print(f"Using model: {model_id}\n", file=sys.stderr)
-    if debug_planning:
+    print(
+        f"GuardAgent: {'on' if enable_guard else 'off (main agent runs tools without guard checks)'}\n",
+        file=sys.stderr,
+    )
+    print(
+        f"Require planning: {'on (write_todos first; plan logged on write_todos)' if require_planning else 'off (tools allowed without plan)'}\n",
+        file=sys.stderr,
+    )
+    if debug_planning and not require_planning:
         print("Planning debug: on (write_todos → stderr)\n", file=sys.stderr)
     if debug_stages:
         print(
             "Stage debug: on (input, tool_selection, tool_observation, post_step, output → stderr)\n",
             file=sys.stderr,
         )
+    if args.embodied:
+        print("Embodied mode: on (text environment tools enabled)\n", file=sys.stderr)
+        reset_embodied_environment()
 
     agent = build_agent(
         model_id,
         debug_planning=debug_planning,
         debug_stages=debug_stages,
+        embodied=args.embodied,
+        enable_guard=enable_guard,
+        require_planning=require_planning,
     )
     result = agent.invoke(
         {

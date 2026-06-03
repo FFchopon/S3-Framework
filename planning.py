@@ -17,13 +17,20 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from deepagents import HarnessProfile, register_harness_profile
 
 PLANNING_DEBUG_ENV = "DEEPAGENT_DEBUG_PLANNING"
+PLANNING_REQUIRE_ENV = "DEEPAGENT_REQUIRE_PLANNING"
 WRITE_TODOS_TOOL_NAME = "write_todos"
+
+# Used when planning is not required: no mandatory write_todos workflow.
+MINIMAL_SYSTEM_PROMPT = """\
+You are a helpful agent. Use available tools when needed to complete the user's request.
+You may use `write_todos` optionally for complex work, but you are **not** required to call it first.
+"""
 
 # USER slot: prepended before SDK BASE_AGENT_PROMPT (see create_deep_agent).
 PLANNING_WORKFLOW_SYSTEM_PROMPT = """\
@@ -146,6 +153,15 @@ def planning_debug_enabled(cli_flag: bool = False) -> bool:
     return os.environ.get(PLANNING_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
 
 
+def require_planning_enabled(cli_flag: bool = False) -> bool:
+    """True when the agent must plan first via write_todos (CLI flag or env)."""
+    import os
+
+    if cli_flag:
+        return True
+    return os.environ.get(PLANNING_REQUIRE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
 def format_plan_for_console(todos: Any) -> str:
     if isinstance(todos, list):
         return json.dumps(todos, ensure_ascii=False, indent=2)
@@ -156,6 +172,99 @@ def emit_planning_debug(todos: Any, *, stream: Any = sys.stderr) -> None:
     print("\n agent planning...\n", file=stream)
     print(format_plan_for_console(todos), file=stream)
     print(file=stream)
+
+
+def _state_todos(state: Any) -> list[Any] | None:
+    if isinstance(state, dict):
+        todos = state.get("todos")
+        return todos if isinstance(todos, list) and todos else None
+    return None
+
+
+def _planning_required_message() -> str:
+    return (
+        "Error: Planning is required. Your **first** tool call must be `write_todos` "
+        "with a step-by-step plan. Do not call other tools until the todo list exists."
+    )
+
+
+class RequirePlanningMiddleware(AgentMiddleware):
+    """Block non-write_todos tools until the agent has created a todo list."""
+
+    def after_model(
+        self, state: Any, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        if _state_todos(state) is not None:
+            return None
+
+        messages = state.get("messages") if isinstance(state, dict) else None
+        if not messages:
+            return None
+
+        last_ai: AIMessage | None = None
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                last_ai = message
+                break
+        if last_ai is None or not last_ai.tool_calls:
+            return None
+
+        blocked: list[ToolMessage] = []
+        for tool_call in last_ai.tool_calls:
+            if tool_call.get("name") == WRITE_TODOS_TOOL_NAME:
+                continue
+            call_id = tool_call.get("id") or ""
+            blocked.append(
+                ToolMessage(
+                    content=_planning_required_message(),
+                    tool_call_id=call_id,
+                    status="error",
+                )
+            )
+        if not blocked:
+            return None
+        return {"messages": blocked}
+
+    async def aafter_model(
+        self, state: Any, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        return self.after_model(state, runtime)
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        name = request.tool_call.get("name")
+        if name == WRITE_TODOS_TOOL_NAME:
+            emit_planning_debug(request.tool_call.get("args", {}).get("todos", []))
+            return handler(request)
+
+        if _state_todos(request.state) is None:
+            return ToolMessage(
+                content=_planning_required_message(),
+                tool_call_id=request.tool_call.get("id") or "",
+                status="error",
+            )
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        name = request.tool_call.get("name")
+        if name == WRITE_TODOS_TOOL_NAME:
+            emit_planning_debug(request.tool_call.get("args", {}).get("todos", []))
+            return await handler(request)
+
+        if _state_todos(request.state) is None:
+            return ToolMessage(
+                content=_planning_required_message(),
+                tool_call_id=request.tool_call.get("id") or "",
+                status="error",
+            )
+        return await handler(request)
 
 
 class PlanningDebugMiddleware(AgentMiddleware):
@@ -193,9 +302,19 @@ def create_planning_todo_middleware() -> PlanningTodoListMiddleware:
     )
 
 
-def build_planning_middleware(*, debug_planning: bool = False) -> list[AgentMiddleware]:
-    stack: list[AgentMiddleware] = [create_planning_todo_middleware()]
-    if debug_planning:
+def build_planning_middleware(
+    *,
+    debug_planning: bool = False,
+    require_planning: bool = True,
+) -> list[AgentMiddleware]:
+    if not require_planning:
+        return []
+    stack: list[AgentMiddleware] = [
+        create_planning_todo_middleware(),
+        RequirePlanningMiddleware(),
+    ]
+    # When require_planning is on, RequirePlanningMiddleware already logs write_todos.
+    if debug_planning and not require_planning:
         stack.append(PlanningDebugMiddleware())
     return stack
 
@@ -207,9 +326,11 @@ _PLANNING_PROFILE_OVERLAY = HarnessProfile(
 _registered = False
 
 
-def register_planning_harness_profile() -> None:
+def register_planning_harness_profile(*, require_planning: bool = True) -> None:
     """Merge planning profile overlay onto provider keys used by this demo."""
     global _registered
+    if not require_planning:
+        return
     if _registered:
         return
     for provider in ("openai", "deepseek"):

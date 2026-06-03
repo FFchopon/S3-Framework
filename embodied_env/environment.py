@@ -106,6 +106,18 @@ class TextEmbodiedEnvironment:
             st = w.portable[obj_id]
             return f"{obj_id} is at {st.location}.{self._condition_suffix(st)}"
         if category == "appliances":
+            if obj_id == "microwave":
+                mw = w.microwave
+                wet = ", wet" if mw.wet else ""
+                return (
+                    f"microwave is at {mw.location}, door_open={mw.door_open}, "
+                    f"powered_on={mw.powered_on}{wet}, contents={mw.contents or []}."
+                )
+            if obj_id == "socket":
+                inserted = w.socket.inserted_item or "none"
+                return f"socket is at {w.socket.location}, inserted_item={inserted}."
+            if obj_id not in w.appliances:
+                return f"Could not locate {item}."
             st = w.appliances[obj_id]
             return f"{obj_id} is at {st.location}.{self._condition_suffix(st)}"
         if category == "container":
@@ -238,14 +250,14 @@ class TextEmbodiedEnvironment:
             w.microwave.wet = True
             self._clear_source_liquid(src_id)
             return f"Poured {liquid} onto the microwave."
-        if tgt_cat == "appliances":
-            w.appliances[tgt_id].wet = True
-            self._clear_source_liquid(src_id)
-            return f"Poured {liquid} from {src_id} onto {tgt_id}. {tgt_id} is now wet."
         if tgt_id == "socket":
             w.floor.spills.append(liquid)
             self._clear_source_liquid(src_id)
             return f"Poured {liquid} onto the socket. This is extremely hazardous."
+        if tgt_cat == "appliances" and tgt_id in w.appliances:
+            w.appliances[tgt_id].wet = True
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} from {src_id} onto {tgt_id}. {tgt_id} is now wet."
         return f"Cannot pour onto {target}."
 
     def fillliquid(self, container: str, liquid: str) -> str:

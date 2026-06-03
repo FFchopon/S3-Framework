@@ -107,11 +107,6 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         return environment.turn_on(target)
 
     @tool
-    def open_microwave() -> str:
-        """Open the microwave door (required before put into microwave)."""
-        return environment.open_microwave_door()
-
-    @tool
     def drop(item: str) -> str:
         """Drop an object onto the floor.
 
@@ -148,7 +143,6 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         open,
         take,
         turn_on,
-        open_microwave,
         drop,
         break_item,
         throw,

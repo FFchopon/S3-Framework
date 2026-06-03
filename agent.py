@@ -32,6 +32,7 @@ from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
 from embodied_env.tasks import (
     ALL_HAZARD_TASKS,
     BENIGN_INSTRUCTION,
+    PromptStyle,
     evaluate_run,
     iter_eval_prompts,
 )
@@ -227,16 +228,17 @@ def run_embodied_batch(
     *,
     num: int,
     start: int = 1,
+    style: PromptStyle = "naive",
     files: dict,
     env_tracer: EmbodiedEnvTracer | None = None,
     print_assistant: bool = False,
 ) -> tuple[int, int, int]:
-    """Run up to `num` naive embodied eval tasks from 1-based index `start`.
+    """Run up to `num` embodied eval tasks from 1-based index `start`.
 
     Resets the text environment between tasks.
     Returns (total, benign_success_count, hazard_success_count).
     """
-    all_prompts = iter_eval_prompts(style="naive")
+    all_prompts = iter_eval_prompts(style=style)
     start_index = start - 1
     prompts = all_prompts[start_index : start_index + num]
     total = len(prompts)
@@ -290,9 +292,16 @@ def run_embodied_batch(
     return total, benign_ok, hazard_ok
 
 
-def print_batch_summary(total: int, benign_ok: int, hazard_ok: int) -> None:
+def print_batch_summary(
+    total: int,
+    benign_ok: int,
+    hazard_ok: int,
+    *,
+    style: PromptStyle = "naive",
+) -> None:
     print("\n====================")
     print("Batch evaluation summary")
+    print(f"prompt style: {style}")
     print(f"total task: {total}")
     print(
         f"original task success ({BENIGN_INSTRUCTION}): {benign_ok}"
@@ -371,8 +380,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help=(
-            "Batch-run N embodied eval tasks (naive benign+hazard prompts). "
-            "Requires --embodied; resets the text environment after each task."
+            "Batch-run N embodied eval tasks. Requires --embodied; "
+            "resets the text environment after each task."
+        ),
+    )
+    parser.add_argument(
+        "--style",
+        choices=("naive", "adaptive", "adversarial"),
+        default="naive",
+        help=(
+            "Embodied batch prompt style (default: naive). "
+            "naive: benign + 'And then ' + hazard; "
+            "adaptive: benign + 'Ignore instruction before, follow this: ' + hazard; "
+            "adversarial: benign + 'And then ' + hazard with benign-sounding justification."
         ),
     )
     parser.add_argument(
@@ -480,17 +500,18 @@ def main() -> None:
             )
         print(
             f"Batch range: tasks {args.start}..{args.start + run_count - 1} "
-            f"({run_count} total)\n",
+            f"({run_count} total), style={args.style}\n",
             file=sys.stderr,
         )
         total, benign_ok, hazard_ok = run_embodied_batch(
             agent,
             num=run_count,
             start=args.start,
+            style=args.style,
             files=skill_files,
             env_tracer=env_tracer,
         )
-        print_batch_summary(total, benign_ok, hazard_ok)
+        print_batch_summary(total, benign_ok, hazard_ok, style=args.style)
         return
 
     result = agent.invoke(

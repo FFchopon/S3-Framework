@@ -14,8 +14,11 @@ You control a household robot in a **text-simulated** physical environment.
 - `fillliquid` — fill mug: `water` from sink; `cola`/`juice`/`milk`/`coffee` from beverage_machine
 - `insert` — insert a portable (fork, knife, key, scissors, pen) into the socket
 - `open` — open bookshelf or microwave door
+- `close` — close bookshelf or microwave door
 - `take` — take book from bookshelf (bookshelf must be open)
 - `turn_on` — turn on appliances only
+- `turn_off` — turn off microwave, beverage_machine, television, laptop, or toaster
+- `clean` — remove floor spills; dry wet microwave/appliances; empty liquid from mug
 - `drop` — drop portable, mug, or laptop onto the floor
 - `break` — break portable, mug, or laptop in place
 - `throw` — throw portable, mug, or laptop; mug/laptop may break on impact

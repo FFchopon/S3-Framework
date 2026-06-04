@@ -14,6 +14,8 @@ from typing import Any
 from guard_recover import (
     GuardStageOutcome,
     RecoverRecommendation,
+    apply_deterministic_post_step_remediation,
+    build_post_step_recover_prompt,
     build_recover_prompt,
     extract_original_content,
     extract_recover_content_from_stderr,
@@ -32,14 +34,37 @@ _EMBODIED_WORLD_RE = re.compile(
     re.DOTALL,
 )
 _RECOVER_STAGES = frozenset({"input", "planning", "tool_selection", "tool_observation"})
-# Only post_step may write the shared embodied world back to Main Agent (incident response).
-_EMBODIED_WORLD_APPLY_STAGES = frozenset({"post_step"})
+# Embodied world is exported only from the recover subprocess (incident response).
+_EMBODIED_WORLD_APPLY_STAGES = frozenset({"recover"})
 
 
 def guard_enabled(cli_flag: bool = False) -> bool:
     if cli_flag:
         return True
     return os.environ.get(GUARD_ENABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+class GuardRecoverTracker:
+    """Count batch tasks with at least one guard recover signal (max one per task)."""
+
+    def __init__(self) -> None:
+        self._current_task = False
+        self.total = 0
+
+    def begin_task(self) -> None:
+        self._current_task = False
+
+    def note_recover(self) -> None:
+        if not self._current_task:
+            self._current_task = True
+
+    def end_task(self) -> bool:
+        """Finalize current task; return True if recover fired at least once."""
+        triggered = self._current_task
+        if triggered:
+            self.total += 1
+        self._current_task = False
+        return triggered
 
 
 def _repo_root() -> Path:
@@ -116,6 +141,35 @@ class GuardCheckResult:
     content: str
     outcome: GuardStageOutcome | None = None
     embodied_world_applied: bool = False
+    remediation_actions: tuple[str, ...] = ()
+    halt_main_agent: bool = False
+
+
+def emit_incident_response_log(
+    *,
+    recommendation: RecoverRecommendation | None,
+    remediation_actions: tuple[str, ...],
+    scene: str,
+    recover_content: str = "",
+) -> None:
+    """Always print post_step incident response to stderr (not gated on debug)."""
+    print("\n[guard:incident-response]", file=sys.stderr)
+    if recommendation and recommendation.risk_summary:
+        print(f"Risk: {recommendation.risk_summary}", file=sys.stderr)
+    print("Remediation steps:", file=sys.stderr)
+    if remediation_actions:
+        for action in remediation_actions:
+            print(f"  - {action}", file=sys.stderr)
+    elif recover_content.strip():
+        print(f"  (recover agent)\n{recover_content.strip()}", file=sys.stderr)
+    else:
+        print("  - (no actions recorded)", file=sys.stderr)
+    print("\nEnvironment after remediation:", file=sys.stderr)
+    print(scene, file=sys.stderr)
+    print(
+        "\n[guard] Main agent run stopped after post_step incident response.\n",
+        file=sys.stderr,
+    )
 
 
 class GuardAgentClient:
@@ -162,7 +216,82 @@ class GuardAgentClient:
             world_applied = _apply_embodied_world_from_stderr(stderr)
 
         recovered_content: Any | None = None
-        if outcome.decision == "recover" and stage in _RECOVER_STAGES:
+        remediation_actions: tuple[str, ...] = ()
+        halt_main_agent = False
+        if outcome.decision == "recover" and stage == "post_step":
+            recommendation = outcome.recover_recommendation or RecoverRecommendation(
+                risk_summary=outcome.reason or "Incident detected in the last agent step.",
+                triggered_pattern="Execute remediate steps in the embodied environment.",
+            )
+            recover_content = ""
+            print("\n[guard:incident-response] starting remediation...\n", file=sys.stderr)
+            if self._embodied:
+                logs = apply_deterministic_post_step_remediation(recommendation)
+                remediation_actions = tuple(logs)
+                world_applied = bool(logs)
+                recover_content = "\n".join(logs) if logs else ""
+                if not logs:
+                    print(
+                        "[guard:incident-response] deterministic remediation produced no "
+                        "actions; invoking recover agent...\n",
+                        file=sys.stderr,
+                    )
+                    recover_message = build_post_step_recover_prompt(
+                        invocations=payload,
+                        recommendation=recommendation,
+                        air_assessment=content,
+                    )
+                    if isinstance(payload, dict) and "embodied_world" in payload:
+                        recover_message = _stringify_payload(
+                            {
+                                "message": recover_message,
+                                "embodied_world": payload.get("embodied_world"),
+                            }
+                        )
+                    else:
+                        recover_message = _stringify_payload(
+                            _wrap_embodied_payload(recover_message)
+                        )
+                    _, recover_stdout, recover_stderr = self._invoke(
+                        "recover", recover_message
+                    )
+                    world_applied = (
+                        _apply_embodied_world_from_stderr(recover_stderr) or world_applied
+                    )
+                    recover_content = _extract_guard_result(recover_stdout)
+            else:
+                recover_message = build_post_step_recover_prompt(
+                    invocations=payload,
+                    recommendation=recommendation,
+                    air_assessment=content,
+                )
+                _, recover_stdout, recover_stderr = self._invoke("recover", recover_message)
+                recover_content = _extract_guard_result(recover_stdout)
+
+            if self._embodied:
+                from embodied_env.tools import get_embodied_environment
+
+                scene = get_embodied_environment().describe_scene()
+            else:
+                scene = "(embodied mode off — no scene snapshot)"
+
+            emit_incident_response_log(
+                recommendation=recommendation,
+                remediation_actions=remediation_actions,
+                scene=scene,
+                recover_content=recover_content,
+            )
+            halt_main_agent = True
+
+            outcome = GuardStageOutcome(
+                decision="recover",
+                reason=outcome.reason,
+                recover_recommendation=recommendation,
+                recovered_content=None,
+                raw_content=recover_content,
+            )
+
+        elif outcome.decision == "recover" and stage in _RECOVER_STAGES:
             recommendation = outcome.recover_recommendation or RecoverRecommendation(
                 risk_summary=outcome.reason or "Risk detected at this pipeline stage.",
                 triggered_pattern="Remove the flagged risk content from the original payload.",
@@ -209,4 +338,6 @@ class GuardAgentClient:
             content=content,
             outcome=outcome,
             embodied_world_applied=world_applied,
+            remediation_actions=remediation_actions,
+            halt_main_agent=halt_main_agent,
         )

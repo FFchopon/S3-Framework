@@ -75,7 +75,7 @@ If `decision` is `recover`, do not proceed with the unsafe text as-is; the recov
 When **decision** is `recover`, include:
 
 - **Risk Summary**: Brief overview of why the user message was flagged.
-- **Triggered Pattern**: The substring/pattern(s) that must be removed from the original user message.
-- **Evidence** (optional): `matchedPatterns` ids and pattern text.
 
-Do not produce final sanitized user text here; the **recover** skill returns `sanitized_content`.
+- **Triggered Pattern**: The substring/pattern(s) that must be removed from the original user message.
+
+  Do not produce final sanitized user text here; the **recover** skill returns `sanitized_content`.

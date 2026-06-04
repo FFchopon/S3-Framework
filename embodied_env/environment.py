@@ -197,11 +197,17 @@ class TextEmbodiedEnvironment:
                 f"Unknown target surface: {surface}. Valid: {', '.join(sorted(PUT_SURFACES))}."
             )
         if category == "portable":
-            self.world.portable[item_id].location = surface
+            w = self.world
+            prev = w.portable[item_id].location
+            w.portable[item_id].location = surface
+            if prev == "socket_receptacle" and w.socket.inserted_item == item_id:
+                w.socket.inserted_item = None
+            if prev == "microwave_interior" and item_id in w.microwave.contents:
+                w.microwave.contents.remove(item_id)
             if item_id == "book" and surface != "bookshelf":
-                if "book" in self.world.bookshelf.contains:
-                    self.world.bookshelf.contains.remove("book")
-            reconcile_world_consistency(self.world)
+                if "book" in w.bookshelf.contains:
+                    w.bookshelf.contains.remove("book")
+            reconcile_world_consistency(w)
             return f"Put {item_id} on {surface}."
         if category == "container":
             liquid_note = ""
@@ -465,6 +471,78 @@ class TextEmbodiedEnvironment:
             w.microwave.powered_on = True
             return "Turned on the microwave."
         return f"Cannot turn on {target}."
+
+    def turn_off(self, target: str) -> str:
+        """Turn off a powered appliance."""
+        key = _normalize_name(target)
+        w = self.world
+        if key == "microwave":
+            if not w.microwave.powered_on:
+                return "Microwave is already off."
+            w.microwave.powered_on = False
+            return "Turned off the microwave."
+        if key == "beverage_machine":
+            if not w.beverage_machine.powered_on:
+                return "Beverage machine is already off."
+            w.beverage_machine.powered_on = False
+            return "Turned off the beverage machine."
+        if key in w.appliances:
+            st = w.appliances[key]
+            if not st.powered_on:
+                return f"{key} is already off."
+            st.powered_on = False
+            return f"Turned off the {key}."
+        return (
+            f"Cannot turn off {target}. "
+            "Valid: microwave, beverage_machine, television, laptop, toaster."
+        )
+
+    def clean(self, target: str) -> str:
+        """Remove spills from the floor or dry wet surfaces / empty the mug."""
+        key = _normalize_name(target)
+        w = self.world
+        if key == "floor":
+            if not w.floor.spills:
+                return "Floor has no spills to clean."
+            removed = ", ".join(w.floor.spills)
+            w.floor.spills = []
+            return f"Cleaned the floor; removed spill(s): {removed}."
+        if key == "microwave":
+            if not w.microwave.wet:
+                return "Microwave is not wet; nothing to clean."
+            w.microwave.wet = False
+            return "Cleaned and dried the microwave."
+        if key in w.appliances:
+            st = w.appliances[key]
+            if not st.wet:
+                return f"{key} is not wet; nothing to clean."
+            st.wet = False
+            return f"Cleaned and dried the {key}."
+        if key == "mug":
+            if w.mug.liquid is None:
+                return "Mug is already empty."
+            liquid = w.mug.liquid
+            w.mug.liquid = None
+            return f"Cleaned the mug (emptied {liquid} at the sink)."
+        return (
+            f"Cannot clean {target}. "
+            "Valid: floor, microwave, television, laptop, toaster, mug."
+        )
+
+    def close(self, target: str) -> str:
+        """Close an openable object (bookshelf or microwave)."""
+        key = _normalize_name(target)
+        w = self.world
+        if key == "bookshelf":
+            if not w.bookshelf.open:
+                return "Bookshelf is already closed."
+            w.bookshelf.open = False
+            return "Closed the bookshelf."
+        if key == "microwave":
+            if not w.microwave.door_open:
+                return "Microwave door is already closed."
+            return self.close_microwave_door()
+        return f"Cannot close {target}. Valid: bookshelf, microwave."
 
     def open_microwave_door(self) -> str:
         self.world.microwave.door_open = True

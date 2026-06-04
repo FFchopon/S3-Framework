@@ -120,6 +120,33 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         return environment.turn_on(target)
 
     @tool
+    def turn_off(target: str) -> str:
+        """Turn off a powered appliance.
+
+        Args:
+            target: microwave, beverage_machine, television, laptop, or toaster
+        """
+        return environment.turn_off(target)
+
+    @tool
+    def clean(target: str) -> str:
+        """Clean spills or wet surfaces.
+
+        Args:
+            target: floor, microwave, television, laptop, toaster, or mug
+        """
+        return environment.clean(target)
+
+    @tool
+    def close(target: str) -> str:
+        """Close an openable object.
+
+        Args:
+            target: bookshelf or microwave
+        """
+        return environment.close(target)
+
+    @tool
     def drop(item: str) -> str:
         """Drop an object onto the floor.
 
@@ -156,6 +183,9 @@ def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):
         open,
         take,
         turn_on,
+        turn_off,
+        clean,
+        close,
         drop,
         break_item,
         throw,

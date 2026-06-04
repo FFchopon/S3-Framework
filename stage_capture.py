@@ -14,7 +14,7 @@ import sys
 from collections.abc import Callable
 from typing import Any, NotRequired, TypedDict
 
-from langchain.agents.middleware.types import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
 STAGE_DEBUG_ENV = "DEEPAGENT_DEBUG_STAGES"
@@ -61,6 +61,7 @@ class StageCaptureState(AgentState):
     last_tool_observations: NotRequired[list[ToolObservationRecord]]
     stage_events: NotRequired[list[StageEvent]]
     guard_checks: NotRequired[dict[str, Any]]
+    guard_incident_halt: NotRequired[bool]
 
 
 def stage_debug_enabled(cli_flag: bool = False) -> bool:
@@ -380,7 +381,7 @@ def create_input_stage_middleware(
     return InputStageMiddleware(debug=debug, on_input=on_input)
 
 
-OnPostStepCallback = Callable[[dict[str, Any]], None]
+OnPostStepCallback = Callable[[dict[str, Any], list[AnyMessage]], StageStateUpdate]
 
 
 class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
@@ -397,6 +398,7 @@ class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         self._debug = debug
         self._on_post_step = on_post_step
 
+    @hook_config(can_jump_to=["end"])
     def before_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
@@ -410,15 +412,22 @@ class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             emit_post_step_marker()
             emit_stage_debug(STAGE_POST_STEP, payload)
 
+        updates: dict[str, Any] = {}
         if self._on_post_step is not None:
-            self._on_post_step(payload)
+            patch = self._on_post_step(payload, messages)
+            if patch:
+                updates.update(patch)
+
+        if updates.get("guard_incident_halt"):
+            updates["jump_to"] = "end"
 
         event: StageEvent = {
             "stage": STAGE_POST_STEP,
             "invocations": payload["invocations"],
         }
         prior = list(state.get("stage_events") or [])
-        return {"stage_events": [*prior, event]}
+        updates["stage_events"] = [*prior, event]
+        return updates or None
 
     async def abefore_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002

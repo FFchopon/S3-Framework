@@ -256,8 +256,8 @@ def main() -> None:
         config={"configurable": {"thread_id": f"guardagent-{stage}"}},
     )
 
-    # Only post_step may export world changes back to Main Agent (see guard_bridge).
-    if args.embodied and stage == "post_step":
+    # post_step AIR detects; recover subprocess performs embodied remediation.
+    if args.embodied and stage == "recover":
         emit_embodied_world_snapshot()
 
     print("\n====================\n")

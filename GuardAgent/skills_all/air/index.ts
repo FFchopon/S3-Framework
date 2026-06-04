@@ -4,16 +4,23 @@ import type {
   AirRulesFile,
   InvokedTool,
   MatchRulesResult,
+  PostStepRecoverRecommendation,
+  RemediateStep,
 } from "./types";
 
-export type { AirRule, InvokedTool, ActivatedRule, MatchRulesResult, AirRulesFile };
+export type {
+  AirRule,
+  InvokedTool,
+  ActivatedRule,
+  MatchRulesResult,
+  AirRulesFile,
+  RemediateStep,
+  PostStepRecoverRecommendation,
+};
 
 /** Virtual path to the rule catalog in the agent filesystem. */
 export const RULES_JSON_PATH = "/skills/air/resources/air-rules.json";
 
-/**
- * Parse rules from air-rules.json file content (obtain via read_file).
- */
 export function loadRulesFromJson(jsonText: string): AirRule[] {
   const parsed = JSON.parse(jsonText) as AirRulesFile;
   if (!parsed || !Array.isArray(parsed.rules)) {
@@ -22,11 +29,6 @@ export function loadRulesFromJson(jsonText: string): AirRule[] {
   return parsed.rules;
 }
 
-/**
- * Step 1: load rules from JSON text, then match invoked tools to triggers.
- *
- * Matching is deterministic: a rule is activated when rule.trigger === invocation.tool.
- */
 export function matchActivatedRules(
   invocations: InvokedTool[],
   rulesJsonText: string,
@@ -64,3 +66,33 @@ export function matchActivatedRules(
   };
 }
 
+export function buildPostStepRecoverRecommendation(
+  activatedRules: ActivatedRule[],
+  incidentRuleIds: string[],
+): PostStepRecoverRecommendation {
+  const idSet = new Set(incidentRuleIds);
+  const remediateSteps: RemediateStep[] = activatedRules
+    .filter((rule) => idSet.has(rule.id))
+    .map((rule) => ({
+      ruleId: rule.id,
+      trigger: rule.trigger,
+      check: rule.check,
+      remediate: rule.remediate,
+      matchedInvocations: rule.matchedInvocations,
+    }));
+
+  const riskSummary =
+    remediateSteps.length === 0
+      ? "Incident detected in the last agent step."
+      : `Incident(s) from rule(s): ${remediateSteps.map((s) => s.ruleId).join(", ")}.`;
+
+  const triggeredPattern = remediateSteps
+    .map((s) => `[${s.ruleId}] ${s.remediate}`)
+    .join(" | ");
+
+  return {
+    riskSummary,
+    triggeredPattern: triggeredPattern || "Execute remediate steps via embodied tools.",
+    remediateSteps,
+  };
+}

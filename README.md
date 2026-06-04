@@ -1,13 +1,13 @@
 | Stage | Implementation | Middleware | Safety Skill | Simple Test | Parameter Pass | Recover |
 |---|---|---|---|---|---|---|
 | input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| memory | - | - | - | - | - | - |
+| memory |  |  |  |  |  |  |
 | planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
 | tool selection | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
 | tool execution | ✔️ | - | - | - | - | - |
 | tool observation | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| post step | ✔️ | ✔️ | ✔️ |  |  |  |
-| output | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |  |
+| post step | ✔️ | ✔️ | ✔️ | ✔️ | - | ✔️ |
+| output | ✔️ | ✔️ | ✔️ |  | ✔️ |  |
 
 - Simple Test (GuardAgent): 
 ```

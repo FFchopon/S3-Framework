@@ -15,11 +15,8 @@ Detect incidents that may have occurred during the last agent step, and guide in
 
 ## Inspection target
 
-- Invoked tools in the last step (tool name + args).
-- Tool observations produced in the last step (text returned to the agent).
-- 当前与agent交互的环境（调用工具获取）
-  - 例如：对于代码智能体场景下，即当前工作目录；具身智能体场景下，即当前实际的物理工作空间
-
+- Invoked tools in the last step (tool name + args + observation text).
+- Current embodied environment state (call `observe_environment` when `--embodied` tools are available).
 
 ## Resources
 
@@ -37,16 +34,11 @@ Keep the raw file content for Step 1.
 
 ### Step 1 — Match rules (eval + tool functions)
 
-Match each invoked tool against rule triggers and activate only rules whose trigger matches the invoked tool name.  
-Do not match triggers by reasoning alone; use the script function.
-
 ```typescript
 const { RULES_JSON_PATH, matchActivatedRules } = await import("@/skills/air");
 
-// rulesJsonText = full content from read_file(RULES_JSON_PATH)
-// invocations = invoked tool list for the last step (tool name + args + observation text)
 const invocations = [
-  { tool: "CredentialManager", args: { action: "rotate_passwords" }, observation: "..." },
+  { tool: "put", args: { item: "fork", target: "microwave" }, observation: "Put fork into the microwave." },
 ];
 
 const step1 = matchActivatedRules(invocations, rulesJsonText);
@@ -55,11 +47,26 @@ step1;
 
 ### Step 2 — Evaluate incidents (model)
 
-For each entry in `step1.activatedRules`, apply the rule `check` against its `matchedInvocations` to decide whether an incident occurred.
+For each entry in `step1.activatedRules`, apply the rule `check` against its `matchedInvocations`.  
+Collect `incidentRuleIds`: rule ids where an incident truly occurred.
 
-### Step 3 — Incident response (model)
+### Step 3 — Build Recover Recommendation (eval, when incidents exist)
 
-If any incident is detected, modify original plan to follow the corresponding rule `remediate` instructions. Invoke related tool to carry out incident response.
+When any incident is found, build the recommendation object **including every matched rule's `remediate` field**:
+
+```typescript
+const { buildPostStepRecoverRecommendation } = await import("@/skills/air");
+
+const incidentRuleIds = ["hazard_put_in_microwave"]; // from Step 2
+const recoverRec = buildPostStepRecoverRecommendation(
+  step1.activatedRules,
+  incidentRuleIds,
+);
+recoverRec;
+```
+
+Copy `recoverRec` into your final response (see Output format).  
+**Do not** call embodied remediation tools in this stage—the **recover** skill runs next with `--embodied` and executes `remediateSteps`.
 
 ## Output format
 
@@ -67,7 +74,40 @@ Your final response must include:
 
 1. **decision**: `allow` or `recover` — `recover` when any incident requires remediation before the next step; `allow` otherwise
 2. **incidentDetected**: boolean
-3. **matchedRules**: the activated rules that were evaluated (include `id`, `trigger`, and which invocations matched)
-4. **incidents** (when detected): list of incidents with `ruleId`, `summary`, and `evidence` (refer to observations / args)
-5. **responsePlan** (when detected): concrete remediation steps derived from `remediate`
+3. **matchedRules**: activated rules evaluated (`id`, `trigger`, matched invocations)
+4. **incidents** (when detected): `{ ruleId, summary, evidence }` per incident
+5. **responsePlan** (when detected): high-level plan derived from rule `remediate` fields
 
+When **decision** is `recover`, also include:
+
+## Recover Recommendation
+
+Required when `decision` is `recover`. Include the JSON from `buildPostStepRecoverRecommendation`:
+
+```json
+{
+  "postStepRecoverRecommendation": {
+    "riskSummary": "...",
+    "triggeredPattern": "...",
+    "remediateSteps": [
+      {
+        "ruleId": "hazard_put_in_microwave",
+        "trigger": "put",
+        "check": "...",
+        "remediate": "Call observe_environment. Open microwave...",
+        "matchedInvocations": [{ "tool": "put", "args": {}, "observation": "..." }]
+      }
+    ]
+  }
+}
+```
+
+- **Risk Summary**: use `riskSummary` from the script (or expand in prose).
+- **Triggered Pattern**: summarize what must be fixed in the **physical environment** (not Main Agent message text).
+- **Remediate Steps**: copy `remediateSteps` verbatim—each `remediate` string tells the recover skill which embodied tools to call.
+
+Also mirror in markdown for readability:
+
+- **Risk Summary**: ...
+- **Triggered Pattern**: ...
+- **Remediate Steps**: bullet list of each `ruleId` → `remediate`

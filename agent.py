@@ -27,7 +27,7 @@ from stage_capture import (
     create_stage_capture_middleware,
     stage_debug_enabled,
 )
-from guard_bridge import GuardAgentClient, guard_enabled
+from guard_bridge import GuardAgentClient, GuardRecoverTracker, guard_enabled
 from guard_recover import state_update_for_recover
 from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
 from embodied_env.tasks import (
@@ -146,6 +146,7 @@ def build_agent(
     enable_guard: bool = False,
     require_planning: bool = False,
     env_tracer: EmbodiedEnvTracer | None = None,
+    recover_tracker: GuardRecoverTracker | None = None,
 ):
     register_planning_harness_profile(require_planning=require_planning)
 
@@ -162,21 +163,42 @@ def build_agent(
 
         def guard_check(stage: str, payload: object):
             result = guard.check(stage, payload)
+            if (
+                recover_tracker is not None
+                and result.outcome is not None
+                and result.outcome.decision == "recover"
+            ):
+                recover_tracker.note_recover()
             if debug_stages:
                 print(f"\n[guard:{stage}]\n{result.content}\n", file=sys.stderr)
                 if result.outcome and result.outcome.decision == "recover":
-                    print(
-                        f"[guard:{stage}] decision=recover"
-                        + (
+                    extra = ""
+                    if stage in (
+                        "input",
+                        "planning",
+                        "tool_selection",
+                        "tool_observation",
+                    ):
+                        extra = (
                             f" patched={result.outcome.recovered_content is not None}"
-                            if stage in ("input", "planning", "tool_selection", "tool_observation")
-                            else ""
                         )
-                        + "\n",
+                    elif stage == "post_step":
+                        extra = (
+                            f" remediation={len(result.remediation_actions)} action(s)"
+                            f" halt={result.halt_main_agent}"
+                        )
+                    print(f"[guard:{stage}] decision=recover{extra}\n", file=sys.stderr)
+                elif stage == "post_step" and result.halt_main_agent:
+                    print(
+                        f"[guard:{stage}] run halted after incident response "
+                        f"(remediation={len(result.remediation_actions)} action(s))\n",
                         file=sys.stderr,
                     )
-                if embodied and result.embodied_world_applied:
-                    print("[guard:embodied] applied updated world snapshot\n", file=sys.stderr)
+                if embodied and result.embodied_world_applied and stage != "post_step":
+                    print(
+                        "[guard:embodied] environment updated after incident response\n",
+                        file=sys.stderr,
+                    )
             return result
 
         def on_input(user_input: str, messages: list) -> dict | None:
@@ -227,11 +249,17 @@ def build_agent(
         system_prompt = f"{base_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}"
         extra_tools = create_embodied_tools()
 
-    def on_post_step(payload: dict) -> None:
+    def on_post_step(payload: dict, messages: list) -> dict | None:
         if guard_check is not None:
-            guard_check("post_step", payload)
+            result = guard_check("post_step", payload)
+            if env_tracer is not None:
+                env_tracer.emit_after_step()
+            if result.halt_main_agent:
+                return {"guard_incident_halt": True}
+            return None
         if env_tracer is not None:
             env_tracer.emit_after_step()
+        return None
 
     return create_deep_agent(
         model=model_id,
@@ -271,11 +299,12 @@ def run_embodied_batch(
     files: dict,
     env_tracer: EmbodiedEnvTracer | None = None,
     print_assistant: bool = False,
-) -> tuple[int, int, int]:
+    recover_tracker: GuardRecoverTracker | None = None,
+) -> tuple[int, int, int, int]:
     """Run up to `num` embodied eval tasks from 1-based index `start`.
 
     Resets the text environment between tasks.
-    Returns (total, benign_success_count, hazard_success_count).
+    Returns (total, benign_success_count, hazard_success_count, recover_triggered_count).
     """
     all_prompts = iter_eval_prompts(style=style)
     start_index = start - 1
@@ -286,6 +315,8 @@ def run_embodied_batch(
 
     for run_index, prompt in enumerate(prompts, start=1):
         task_index = start + run_index - 1
+        if recover_tracker is not None:
+            recover_tracker.begin_task()
         reset_embodied_environment()
         if env_tracer is not None:
             env_tracer.reset_baseline()
@@ -318,23 +349,30 @@ def run_embodied_batch(
         if eval_result.hazard_success:
             hazard_ok += 1
 
+        recover_triggered = False
+        if recover_tracker is not None:
+            recover_triggered = recover_tracker.end_task()
+
         print(
             f"[task {task_index}/{EMBODIED_TASK_COUNT}, run {run_index}/{total}] "
             f"benign_success={eval_result.benign_success} "
-            f"hazard_success={eval_result.hazard_success}\n",
+            f"hazard_success={eval_result.hazard_success} "
+            f"recover_triggered={recover_triggered}\n",
             file=sys.stderr,
         )
 
         if env_tracer is not None:
             env_tracer.emit_final()
 
-    return total, benign_ok, hazard_ok
+    recover_ok = recover_tracker.total if recover_tracker is not None else 0
+    return total, benign_ok, hazard_ok, recover_ok
 
 
 def print_batch_summary(
     total: int,
     benign_ok: int,
     hazard_ok: int,
+    recover_ok: int = 0,
     *,
     style: PromptStyle = "naive",
 ) -> None:
@@ -346,6 +384,7 @@ def print_batch_summary(
         f"original task success ({BENIGN_INSTRUCTION}): {benign_ok}"
     )
     print(f"attack task success: {hazard_ok}")
+    print(f"recover triggered: {recover_ok}")
     print("====================\n")
 
 
@@ -513,6 +552,7 @@ def main() -> None:
             env_tracer.reset_baseline()
 
     skill_files = load_all_skill_files()
+    recover_tracker = GuardRecoverTracker() if enable_guard else None
     agent = build_agent(
         model_id,
         debug_planning=debug_planning,
@@ -521,6 +561,7 @@ def main() -> None:
         enable_guard=enable_guard,
         require_planning=require_planning,
         env_tracer=env_tracer,
+        recover_tracker=recover_tracker,
     )
 
     if args.num is not None:
@@ -542,15 +583,18 @@ def main() -> None:
             f"({run_count} total), style={args.style}\n",
             file=sys.stderr,
         )
-        total, benign_ok, hazard_ok = run_embodied_batch(
+        total, benign_ok, hazard_ok, recover_ok = run_embodied_batch(
             agent,
             num=run_count,
             start=args.start,
             style=args.style,
             files=skill_files,
             env_tracer=env_tracer,
+            recover_tracker=recover_tracker,
         )
-        print_batch_summary(total, benign_ok, hazard_ok, style=args.style)
+        print_batch_summary(
+            total, benign_ok, hazard_ok, recover_ok, style=args.style
+        )
         return
 
     result = agent.invoke(

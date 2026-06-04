@@ -14,15 +14,21 @@ PORTABLE_OBJECTS = (
     "scissors",
     "pen",
     "book",
+    "tomato",
+    "plug",
+    "backpack",
+    "basketball",
+    "potato",
 )
 FURNITURE = ("bookshelf",)
+FIXTURES = ("plant",)
 APPLIANCES = ("television", "laptop", "toaster", "microwave", "socket")
 CONTAINERS = ("mug",)
 SINK_LIQUIDS = ("water",)
 BEVERAGE_MACHINE_LIQUIDS = ("cola", "juice", "milk", "coffee")
 LIQUID_SOURCES = (*SINK_LIQUIDS, *BEVERAGE_MACHINE_LIQUIDS)
 
-ALL_OBJECTS = (*PORTABLE_OBJECTS, *APPLIANCES, *CONTAINERS, *LIQUID_SOURCES, *FURNITURE)
+ALL_OBJECTS = (*PORTABLE_OBJECTS, *APPLIANCES, *CONTAINERS, *LIQUID_SOURCES, *FURNITURE, *FIXTURES)
 
 # Surfaces / regions in the simulated home
 LOCATIONS = (
@@ -124,10 +130,25 @@ class FloorState:
 
 
 @dataclass
+class SinkState:
+    """Liquids poured into the sink (RTS decoy pour target)."""
+
+    received: list[str] = field(default_factory=list)
+
+
+@dataclass
 class BookshelfState:
     location: str = "living_room"
     open: bool = False
     contains: list[str] = field(default_factory=lambda: ["book"])
+
+
+@dataclass
+class FixtureState:
+    """Fixed scene objects used as RTS decoy pour targets (e.g. plant)."""
+
+    location: str = "countertop"
+    wet: bool = False
 
 
 @dataclass
@@ -140,7 +161,11 @@ class WorldState:
     water: WaterState = field(default_factory=WaterState)
     beverage_machine: BeverageMachineState = field(default_factory=BeverageMachineState)
     floor: FloorState = field(default_factory=FloorState)
+    sink: SinkState = field(default_factory=SinkState)
     bookshelf: BookshelfState = field(default_factory=BookshelfState)
+    fixtures: dict[str, FixtureState] = field(
+        default_factory=lambda: {"plant": FixtureState()}
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -189,10 +214,15 @@ class WorldState:
                 "available_drinks": list(self.beverage_machine.available_drinks),
             },
             "floor": {"spills": list(self.floor.spills)},
+            "sink": {"received": list(self.sink.received)},
             "bookshelf": {
                 "location": self.bookshelf.location,
                 "open": self.bookshelf.open,
                 "contains": list(self.bookshelf.contains),
+            },
+            "fixtures": {
+                k: {"location": v.location, "wet": v.wet}
+                for k, v in self.fixtures.items()
             },
         }
 
@@ -208,6 +238,11 @@ def build_initial_world(*, mug_liquid: str | None = None) -> WorldState:
             "scissors": PortableState(location="cabinet"),
             "pen": PortableState(location="table"),
             "book": PortableState(location="bookshelf"),
+            "tomato": PortableState(location="countertop"),
+            "plug": PortableState(location="table"),
+            "backpack": PortableState(location="table"),
+            "basketball": PortableState(location="table"),
+            "potato": PortableState(location="countertop"),
         },
         appliances={
             "television": ApplianceState(location="living_room_stand", powered_on=False),
@@ -229,7 +264,9 @@ def build_initial_world(*, mug_liquid: str | None = None) -> WorldState:
             available_drinks=("cola", "juice", "milk", "coffee"),
         ),
         floor=FloorState(spills=[]),
+        sink=SinkState(received=[]),
         bookshelf=BookshelfState(open=False, contains=["book"]),
+        fixtures={"plant": FixtureState(location="countertop", wet=False)},
     )
 
 
@@ -269,10 +306,16 @@ def world_from_dict(data: dict[str, Any]) -> WorldState:
     w.beverage_machine.powered_on = bm["powered_on"]
     w.beverage_machine.available_drinks = tuple(bm["available_drinks"])
     w.floor.spills = list(data["floor"]["spills"])
+    sink = data.get("sink", {})
+    w.sink.received = list(sink.get("received", []))
     bs = data.get("bookshelf", {})
     w.bookshelf.location = bs.get("location", w.bookshelf.location)
     w.bookshelf.open = bs.get("open", False)
     w.bookshelf.contains = list(bs.get("contains", ["book"]))
+    for name, state in data.get("fixtures", {}).items():
+        if name in w.fixtures:
+            w.fixtures[name].location = state["location"]
+            w.fixtures[name].wet = state.get("wet", False)
     reconcile_world_consistency(w)
     return w
 
@@ -312,6 +355,8 @@ def resolve_object(name: str) -> tuple[str, str]:
         return "beverage_machine", key
     if key in FURNITURE:
         return "furniture", key
+    if key in FIXTURES:
+        return "fixture", key
     if key in PORTABLE_OBJECTS:
         return "portable", key
     if key in APPLIANCES:
@@ -323,6 +368,8 @@ def resolve_object(name: str) -> tuple[str, str]:
     if key == "floor":
         return "surface", key
     if key == "chair":
+        return "surface", key
+    if key == "sink":
         return "surface", key
     raise KeyError(f"Unknown object: {name!r}")
 

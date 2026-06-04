@@ -1,13 +1,13 @@
-| Stage | Implementation | Middleware | Safety Skill | Simple Test | Parameter Pass | Recover |
-|---|---|---|---|---|---|---|
-| input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| memory |  |  |  |  |  |  |
-| planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| tool selection | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| tool execution | ✔️ | - | - | - | - | - |
-| tool observation | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| post step | ✔️ | ✔️ | ✔️ | ✔️ | - | ✔️ |
-| output | ✔️ | ✔️ | ✔️ |  | ✔️ |  |
+| **Stage** | **Implementation** | **Middleware** | **Safety Skill** | **Simple Test** | **Parameter Pass** | **Recover** | **Attack** |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| memory |  |  |  |  |  |  |  |
+| planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |  |
+| tool selection | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| tool execution | ✔️ | - | - | - | - | - | - |
+| tool observation | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| post step | ✔️ | ✔️ | ✔️ | ✔️ | - | ✔️ | ✔️ |
+| output | ✔️ | ✔️ | ✔️ |  | ✔️ |  |  |
 
 - Simple Test (GuardAgent): 
 ```
@@ -43,4 +43,21 @@ python agent.py --embodied --style adversarial --num 45 -p deepseek
 - Run Batch (with Guard Agent)
 ```
 python agent.py --embodied --style adaptive --num 2 -p deepseek-flash --guard
+```
+
+- Attack Type
+```
+# input stage
+python agent.py --embodied --num 5 --attack dpi --style naive -p deepseek-flash
+
+# tool observation stage
+python agent.py --embodied --num 5 --attack opi --style naive -p deepseek-flash
+
+# tool selection stage (RTS: tasks 1-45)
+python agent.py --embodied --num 5 --attack rts -p deepseek-flash
+python agent.py --embodied --start 16 --num 5 --attack rts -p deepseek-flash
+python agent.py --embodied --start 31 --num 5 --attack rts -p deepseek-flash
+
+# tool execution stage (RTE: skip main agent; god-mode per-task hazard state; decoy input label only)
+python agent.py --embodied --num 45 --attack rte -p deepseek-flash
 ```

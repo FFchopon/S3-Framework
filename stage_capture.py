@@ -62,6 +62,11 @@ class StageCaptureState(AgentState):
     stage_events: NotRequired[list[StageEvent]]
     guard_checks: NotRequired[dict[str, Any]]
     guard_incident_halt: NotRequired[bool]
+    attack_type: NotRequired[str]
+    opi_injection: NotRequired[str]
+    opi_applied: NotRequired[bool]
+    rts_hazard_task: NotRequired[dict[str, Any]]
+    rts_applied: NotRequired[bool]
 
 
 def stage_debug_enabled(cli_flag: bool = False) -> bool:

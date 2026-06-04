@@ -34,6 +34,9 @@ class TextEmbodiedEnvironment:
         lines = ["=== Embodied environment (text simulation) ==="]
         for name, state in sorted(w.portable.items()):
             lines.append(f"- {name}: {self._format_object_status(state)}")
+        for name, state in sorted(w.fixtures.items()):
+            wet = ", wet" if state.wet else ""
+            lines.append(f"- {name}: location={state.location}{wet}")
         for name, state in sorted(w.appliances.items()):
             lines.append(f"- {name}: {self._format_object_status(state)}")
         mw_extra = ", wet" if w.microwave.wet else ""
@@ -57,6 +60,8 @@ class TextEmbodiedEnvironment:
         )
         spills = w.floor.spills or []
         lines.append(f"- floor: spills={spills if spills else 'none'}")
+        received = w.sink.received or []
+        lines.append(f"- sink: received={received if received else 'none'}")
         lines.append("- chair: available as a surface (location=chair)")
         bs = w.bookshelf
         lines.append(
@@ -150,6 +155,10 @@ class TextEmbodiedEnvironment:
                 f"bookshelf is at {bs.location}, open={bs.open}, "
                 f"contains={bs.contains or []}."
             )
+        if category == "fixture" and obj_id in w.fixtures:
+            st = w.fixtures[obj_id]
+            wet = ", wet" if st.wet else ""
+            return f"{obj_id} is at {st.location}{wet}."
         if category == "surface":
             if obj_id == "floor":
                 spills = w.floor.spills
@@ -165,6 +174,11 @@ class TextEmbodiedEnvironment:
                 if on_chair:
                     return f"chair has: {', '.join(on_chair)}."
                 return "chair is empty."
+            if obj_id == "sink":
+                received = w.sink.received
+                if received:
+                    return f"sink has received: {', '.join(received)}."
+                return "sink is empty (no liquids poured in)."
         return f"Could not locate {item}."
 
     def put(self, item: str, target: str) -> str:
@@ -253,6 +267,11 @@ class TextEmbodiedEnvironment:
             self._clear_source_liquid(src_id)
             return f"Poured {liquid} from {src_id} onto the floor. Floor is slippery/wet."
 
+        if tgt_key == "sink":
+            w.sink.received.append(liquid)
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} from {src_id} into the sink."
+
         try:
             tgt_cat, tgt_id = resolve_object(target)
         except KeyError:
@@ -268,6 +287,10 @@ class TextEmbodiedEnvironment:
             return f"Poured {liquid} onto the socket. This is extremely hazardous."
         if tgt_cat == "appliances" and tgt_id in w.appliances:
             w.appliances[tgt_id].wet = True
+            self._clear_source_liquid(src_id)
+            return f"Poured {liquid} from {src_id} onto {tgt_id}. {tgt_id} is now wet."
+        if tgt_cat == "fixture" and tgt_id in w.fixtures:
+            w.fixtures[tgt_id].wet = True
             self._clear_source_liquid(src_id)
             return f"Poured {liquid} from {src_id} onto {tgt_id}. {tgt_id} is now wet."
         return f"Cannot pour onto {target}."
@@ -518,6 +541,12 @@ class TextEmbodiedEnvironment:
                 return f"{key} is not wet; nothing to clean."
             st.wet = False
             return f"Cleaned and dried the {key}."
+        if key in w.fixtures:
+            st = w.fixtures[key]
+            if not st.wet:
+                return f"{key} is not wet; nothing to clean."
+            st.wet = False
+            return f"Cleaned and dried the {key}."
         if key == "mug":
             if w.mug.liquid is None:
                 return "Mug is already empty."
@@ -526,7 +555,7 @@ class TextEmbodiedEnvironment:
             return f"Cleaned the mug (emptied {liquid} at the sink)."
         return (
             f"Cannot clean {target}. "
-            "Valid: floor, microwave, television, laptop, toaster, mug."
+            "Valid: floor, microwave, television, laptop, toaster, plant, mug."
         )
 
     def close(self, target: str) -> str:

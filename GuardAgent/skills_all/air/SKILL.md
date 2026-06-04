@@ -65,8 +65,9 @@ If any incident is detected, modify original plan to follow the corresponding ru
 
 Your final response must include:
 
-1. **incidentDetected**: boolean
-2. **matchedRules**: the activated rules that were evaluated (include `id`, `trigger`, and which invocations matched)
-3. **incidents** (when detected): list of incidents with `ruleId`, `summary`, and `evidence` (refer to observations / args)
-4. **responsePlan** (when detected): concrete remediation steps derived from `remediate`
+1. **decision**: `allow` or `recover` — `recover` when any incident requires remediation before the next step; `allow` otherwise
+2. **incidentDetected**: boolean
+3. **matchedRules**: the activated rules that were evaluated (include `id`, `trigger`, and which invocations matched)
+4. **incidents** (when detected): list of incidents with `ruleId`, `summary`, and `evidence` (refer to observations / args)
+5. **responsePlan** (when detected): concrete remediation steps derived from `remediate`
 

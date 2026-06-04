@@ -67,15 +67,25 @@ step2;
 
 ### Step 3 — Final decision (model)
 
-If `step2.blocked` is true, the final decision must be `disallow` and you must explain which rule(s) were violated and why the tool execution must not proceed.
+If `step2.blocked` is true, the final decision must be `recover` and you must explain which rule(s) were violated. The recover skill will remove unsafe tool calls from the selection.
 
 ## Output format
 
 After completing the workflow, your final response **must** include:
 
-1. **decision**: `allow` or `disallow`
+1. **decision**: `allow` or `recover`
    - Use `allow` only when no predicate violation is detected.
-   - Use `disallow` when any predicate violation is detected.
+   - Use `recover` when any predicate violation is detected.
 
 2. **reason**: 2–3 sentences explaining the decision
    - Reference matched tools, activated rules, and violated predicates (or why the selection is acceptable).
+
+## Recover Recommendation
+
+When **decision** is `recover`, include:
+
+- **Risk Summary**: Why the pending tool selection is unsafe.
+- **Triggered Pattern**: Which tool call(s) or args must be removed or rewritten.
+- **Evidence** (optional): rule ids, `step2.violations`, and affected tool names.
+
+The **recover** skill returns a sanitized tool call list as `sanitized_content`.

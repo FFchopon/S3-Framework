@@ -5,6 +5,7 @@ from __future__ import annotations
 from langchain_core.tools import tool
 
 from embodied_env.environment import TextEmbodiedEnvironment
+from embodied_env.world import reconcile_world_consistency, world_from_dict
 
 # Module-level environment instance (one scene per process / agent session)
 _ENV: TextEmbodiedEnvironment | None = None
@@ -19,6 +20,18 @@ def get_embodied_environment() -> TextEmbodiedEnvironment:
 
 def reset_embodied_environment(*, mug_liquid: str | None = None) -> str:
     return get_embodied_environment().reset(mug_liquid=mug_liquid)
+
+
+def get_embodied_world_snapshot() -> dict:
+    """Serialize current text environment for cross-process GuardAgent sync."""
+    return get_embodied_environment().world.to_dict()
+
+
+def apply_embodied_world_snapshot(data: dict) -> None:
+    """Restore text environment from a snapshot (e.g. after GuardAgent post_step remediation)."""
+    world = world_from_dict(data)
+    reconcile_world_consistency(world)
+    get_embodied_environment().world = world
 
 
 def create_embodied_tools(env: TextEmbodiedEnvironment | None = None):

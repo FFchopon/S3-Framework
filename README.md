@@ -1,13 +1,13 @@
-| Stage | Implementation | Middleware | Safety Skill | Simple Test | Parameter Pass |
-|---|---|---|---|---|---|
-| input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| memory | - | - | - | - | - |
-| planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| tool selection | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| tool execution | ✔️ | - | - | - | - |
-| tool observation | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
-| post step | ✔️ | ✔️ | ✔️ |  |  |
-| output | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| Stage | Implementation | Middleware | Safety Skill | Simple Test | Parameter Pass | Recover |
+|---|---|---|---|---|---|---|
+| input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| memory | - | - | - | - | - | - |
+| planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| tool selection | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| tool execution | ✔️ | - | - | - | - | - |
+| tool observation | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
+| post step | ✔️ | ✔️ | ✔️ |  |  |  |
+| output | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |  |
 
 - Simple Test (GuardAgent): 
 ```
@@ -38,4 +38,9 @@ python agent.py --embodied --style adaptive --start 10 --num 5 -p deepseek
 python agent.py --embodied --style adversarial --num 5 -p deepseek
 python agent.py --embodied --style adversarial --start 10 --num 5 -p deepseek
 python agent.py --embodied --style adversarial --num 45 -p deepseek
+```
+
+- Run Batch (with Guard Agent)
+```
+python agent.py --embodied --style adaptive --num 2 -p deepseek-flash --guard
 ```

@@ -28,6 +28,7 @@ from stage_capture import (
     stage_debug_enabled,
 )
 from guard_bridge import GuardAgentClient, guard_enabled
+from guard_recover import state_update_for_recover
 from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
 from embodied_env.tasks import (
     ALL_HAZARD_TASKS,
@@ -153,33 +154,69 @@ def build_agent(
     on_tool_selection = None
     on_tool_observation = None
     on_output = None
+    on_post_step = None
+    guard_check = None
 
     if enable_guard:
-        guard = GuardAgentClient(model_id=model_id)
+        guard = GuardAgentClient(model_id=model_id, embodied=embodied)
 
-        def _guard_check(stage: str, payload: object) -> None:
+        def guard_check(stage: str, payload: object):
             result = guard.check(stage, payload)
             if debug_stages:
                 print(f"\n[guard:{stage}]\n{result.content}\n", file=sys.stderr)
+                if result.outcome and result.outcome.decision == "recover":
+                    print(
+                        f"[guard:{stage}] decision=recover"
+                        + (
+                            f" patched={result.outcome.recovered_content is not None}"
+                            if stage in ("input", "planning", "tool_selection", "tool_observation")
+                            else ""
+                        )
+                        + "\n",
+                        file=sys.stderr,
+                    )
+                if embodied and result.embodied_world_applied:
+                    print("[guard:embodied] applied updated world snapshot\n", file=sys.stderr)
+            return result
 
-        def on_input(user_input: str) -> None:
-            _guard_check("input", user_input)
+        def on_input(user_input: str, messages: list) -> dict | None:
+            result = guard_check("input", user_input)
+            if result.outcome and result.outcome.recovered_content is not None:
+                return state_update_for_recover(
+                    messages, "input", result.outcome.recovered_content
+                )
+            return None
 
-        def on_planning(todos: object) -> None:
-            _guard_check("planning", todos)
+        def on_planning(todos: object, messages: list) -> dict | None:
+            result = guard_check("planning", todos)
+            if result.outcome and result.outcome.recovered_content is not None:
+                return state_update_for_recover(
+                    messages, "planning", result.outcome.recovered_content
+                )
+            return None
 
-        def on_tool_selection(tool_calls: list[dict]) -> None:
-            _guard_check("tool_selection", tool_calls)
+        def on_tool_selection(tool_calls: list[dict], messages: list) -> dict | None:
+            result = guard_check("tool_selection", tool_calls)
+            if result.outcome and result.outcome.recovered_content is not None:
+                return state_update_for_recover(
+                    messages, "tool_selection", result.outcome.recovered_content
+                )
+            return None
 
-        def on_tool_observation(observations: list[dict]) -> None:
+        def on_tool_observation(observations: list[dict], messages: list) -> dict | None:
             if len(observations) == 1 and isinstance(observations[0].get("content"), str):
                 payload: object = observations[0]["content"]
             else:
                 payload = observations
-            _guard_check("tool_observation", payload)
+            result = guard_check("tool_observation", payload)
+            if result.outcome and result.outcome.recovered_content is not None:
+                return state_update_for_recover(
+                    messages, "tool_observation", result.outcome.recovered_content
+                )
+            return None
 
         def on_output(model_output: str) -> None:
-            _guard_check("output", model_output)
+            guard_check("output", model_output)
 
     base_prompt = (
         PLANNING_WORKFLOW_SYSTEM_PROMPT if require_planning else MINIMAL_SYSTEM_PROMPT
@@ -190,7 +227,9 @@ def build_agent(
         system_prompt = f"{base_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}"
         extra_tools = create_embodied_tools()
 
-    def on_post_step() -> None:
+    def on_post_step(payload: dict) -> None:
+        if guard_check is not None:
+            guard_check("post_step", payload)
         if env_tracer is not None:
             env_tracer.emit_after_step()
 

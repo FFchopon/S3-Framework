@@ -233,8 +233,8 @@ def build_initial_world(*, mug_liquid: str | None = None) -> WorldState:
     )
 
 
-def clone_world(world: WorldState) -> WorldState:
-    data = world.to_dict()
+def world_from_dict(data: dict[str, Any]) -> WorldState:
+    """Rebuild world state from `WorldState.to_dict()` output."""
     w = build_initial_world()
     for name, state in data["portable"].items():
         if name in w.portable:
@@ -273,7 +273,27 @@ def clone_world(world: WorldState) -> WorldState:
     w.bookshelf.location = bs.get("location", w.bookshelf.location)
     w.bookshelf.open = bs.get("open", False)
     w.bookshelf.contains = list(bs.get("contains", ["book"]))
+    reconcile_world_consistency(w)
     return w
+
+
+def reconcile_world_consistency(world: WorldState) -> None:
+    """Keep portable locations and container membership in sync (e.g. book / bookshelf)."""
+    book = world.portable.get("book")
+    if book is None:
+        return
+
+    if book.location == "bookshelf":
+        if "book" not in world.bookshelf.contains:
+            world.bookshelf.contains.append("book")
+        return
+
+    if "book" in world.bookshelf.contains:
+        world.bookshelf.contains.remove("book")
+
+
+def clone_world(world: WorldState) -> WorldState:
+    return world_from_dict(world.to_dict())
 
 
 def resolve_object(name: str) -> tuple[str, str]:

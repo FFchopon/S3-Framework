@@ -19,5 +19,7 @@ You evaluate safety for a single pipeline stage of a Main Agent.
 
 ## Output
 
-Follow the active skill's output format (e.g. allow/disallow, sanitized text, or structured fields).
+Follow the active skill's output format (e.g. allow/recover, sanitized text, or structured fields).
+
+When **decision** is `recover`, include the skill's **Recover Recommendation** section (if defined) so the recover skill can sanitize Main Agent content.
 """

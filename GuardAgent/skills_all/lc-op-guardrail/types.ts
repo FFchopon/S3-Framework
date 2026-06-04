@@ -21,7 +21,7 @@ export type MatchBlockedPatternsResult = {
 
 export type OutputGuardrailEvaluation = {
   agentOutput: string;
-  decision: "allow" | "disallow";
+  decision: "allow" | "recover";
   reason: string;
   matchedPatterns: MatchedBlockedPattern[];
 };

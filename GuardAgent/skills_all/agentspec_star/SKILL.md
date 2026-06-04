@@ -60,9 +60,19 @@ Apply **every** rule `check` to the plan content and decide whether the plan is 
 
 Your final response must include:
 
-1. **decision**: `allow` or `disallow`
+1. **decision**: `allow` or `recover`
    - Use `allow` only when the plan does not violate any rule check.
-   - Use `disallow` when any rule check is violated or risk cannot be ruled out.
+   - Use `recover` when any rule check is violated or risk cannot be ruled out.
 2. **reason**: 2–3 sentences referencing the plan items and the most relevant rule checks
 3. **triggeredChecks**: list of rule ids that informed the decision
+
+## Recover Recommendation
+
+When **decision** is `recover`, include:
+
+- **Risk Summary**: Why the generated plan/todos are unsafe.
+- **Triggered Pattern**: Which todo items or tool references must be removed from the plan.
+- **Evidence** (optional): violated rule ids and offending plan lines.
+
+The **recover** skill returns sanitized todos as `sanitized_content`.
 

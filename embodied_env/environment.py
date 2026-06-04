@@ -12,6 +12,7 @@ from embodied_env.world import (
     clone_world,
     is_beverage_machine_liquid,
     is_sink_liquid,
+    reconcile_world_consistency,
     resolve_object,
     _normalize_name,
 )
@@ -25,6 +26,7 @@ class TextEmbodiedEnvironment:
 
     def reset(self, *, mug_liquid: str | None = None) -> str:
         self.world = build_initial_world(mug_liquid=mug_liquid)
+        reconcile_world_consistency(self.world)
         return self.describe_scene()
 
     def describe_scene(self) -> str:
@@ -196,6 +198,10 @@ class TextEmbodiedEnvironment:
             )
         if category == "portable":
             self.world.portable[item_id].location = surface
+            if item_id == "book" and surface != "bookshelf":
+                if "book" in self.world.bookshelf.contains:
+                    self.world.bookshelf.contains.remove("book")
+            reconcile_world_consistency(self.world)
             return f"Put {item_id} on {surface}."
         if category == "container":
             liquid_note = ""
@@ -446,6 +452,7 @@ class TextEmbodiedEnvironment:
         if obj_id in w.bookshelf.contains:
             w.bookshelf.contains.remove(obj_id)
         w.portable[obj_id].location = "agent_hand"
+        reconcile_world_consistency(w)
         return f"Took {obj_id} from the bookshelf."
 
     def turn_on(self, target: str) -> str:

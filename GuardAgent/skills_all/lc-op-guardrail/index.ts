@@ -89,7 +89,7 @@ export function evaluateAgentOutput(
   const ids = result.matchedPatterns.map((m) => m.id).join(", ");
   return {
     agentOutput: result.agentOutput,
-    decision: "disallow",
+    decision: "recover",
     reason: `Blocked pattern(s) detected in agent output: ${ids}.`,
     matchedPatterns: result.matchedPatterns,
   };

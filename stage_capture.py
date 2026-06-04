@@ -49,6 +49,7 @@ class StageEvent(TypedDict):
     planning_todos: NotRequired[Any]
     tool_calls: NotRequired[list[ToolCallPlan]]
     observations: NotRequired[list[ToolObservationRecord]]
+    invocations: NotRequired[list[dict[str, Any]]]
 
 
 class StageCaptureState(AgentState):
@@ -176,6 +177,33 @@ def emit_stage_debug(stage: str, payload: Any, *, stream: Any = sys.stderr) -> N
     print(file=stream)
 
 
+def extract_last_step_invocations(messages: list[AnyMessage]) -> list[dict[str, Any]]:
+    """Tool name, args, and observation text for the most recently completed step."""
+    observations = extract_latest_tool_observations(messages)
+    last_ai = _last_ai_message(messages)
+    if last_ai is None or not last_ai.tool_calls:
+        return []
+
+    obs_by_id = {record["tool_call_id"]: record for record in observations}
+    invocations: list[dict[str, Any]] = []
+    for tool_call in last_ai.tool_calls:
+        call_id = tool_call.get("id") or ""
+        observation = obs_by_id.get(call_id)
+        invocations.append(
+            {
+                "tool": tool_call.get("name") or "",
+                "args": dict(tool_call.get("args") or {}),
+                "observation": observation["content"] if observation else "",
+            }
+        )
+    return invocations
+
+
+def build_post_step_payload(messages: list[AnyMessage]) -> dict[str, Any]:
+    """Payload for GuardAgent post_step (AIR): last-step tools + observations."""
+    return {"invocations": extract_last_step_invocations(messages)}
+
+
 def emit_post_step_marker(*, stream: Any = sys.stderr) -> None:
     print("\n post step stage\n", file=stream)
 
@@ -185,11 +213,12 @@ def is_completed_tool_step(messages: list[AnyMessage]) -> bool:
     return len(extract_latest_tool_observations(messages)) > 0
 
 
-OnToolSelectionCallback = Callable[[list[ToolCallPlan]], None]
-OnToolObservationCallback = Callable[[list[ToolObservationRecord]], None]
-OnInputCallback = Callable[[str], None]
+StageStateUpdate = dict[str, Any] | None
+OnToolSelectionCallback = Callable[[list[ToolCallPlan], list[AnyMessage]], StageStateUpdate]
+OnToolObservationCallback = Callable[[list[ToolObservationRecord], list[AnyMessage]], StageStateUpdate]
+OnInputCallback = Callable[[str, list[AnyMessage]], StageStateUpdate]
 OnOutputCallback = Callable[[str], None]
-OnPlanningCallback = Callable[[Any], None]
+OnPlanningCallback = Callable[[Any, list[AnyMessage]], StageStateUpdate]
 
 
 class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
@@ -221,8 +250,13 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if self._debug:
             emit_stage_debug(STAGE_TOOL_SELECTION, pending)
 
+        updates: dict[str, Any] = {
+            "last_tool_selection": pending,
+        }
         if self._on_tool_selection is not None:
-            self._on_tool_selection(pending)
+            patch = self._on_tool_selection(pending, messages)
+            if patch:
+                updates.update(patch)
 
         # planning: write_todos tool call args contain the natural-language plan todos
         if self._on_planning is not None:
@@ -230,7 +264,9 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
                 if call.get("name") == WRITE_TODOS_TOOL_NAME:
                     todos = (call.get("args") or {}).get("todos")
                     if todos is not None:
-                        self._on_planning(todos)
+                        plan_patch = self._on_planning(todos, messages)
+                        if plan_patch:
+                            updates.update(plan_patch)
                     break
 
         event: StageEvent = {
@@ -238,10 +274,8 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             "tool_calls": pending,
         }
         prior = list(state.get("stage_events") or [])
-        return {
-            "last_tool_selection": pending,
-            "stage_events": [*prior, event],
-        }
+        updates["stage_events"] = [*prior, event]
+        return updates
 
     async def aafter_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -259,18 +293,21 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if self._debug:
             emit_stage_debug(STAGE_TOOL_OBSERVATION, observations)
 
+        updates: dict[str, Any] = {
+            "last_tool_observations": observations,
+        }
         if self._on_tool_observation is not None:
-            self._on_tool_observation(observations)
+            patch = self._on_tool_observation(observations, messages)
+            if patch:
+                updates.update(patch)
 
         event: StageEvent = {
             "stage": STAGE_TOOL_OBSERVATION,
             "observations": observations,
         }
         prior = list(state.get("stage_events") or [])
-        return {
-            "last_tool_observations": observations,
-            "stage_events": [*prior, event],
-        }
+        updates["stage_events"] = [*prior, event]
+        return updates
 
     async def abefore_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -315,18 +352,21 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if self._debug:
             emit_stage_debug(STAGE_INPUT, {"user_input": user_input})
 
+        updates: dict[str, Any] = {
+            "last_user_input": user_input,
+        }
         if self._on_input is not None:
-            self._on_input(user_input)
+            patch = self._on_input(user_input, messages)
+            if patch:
+                updates.update(patch)
 
         event: StageEvent = {
             "stage": STAGE_INPUT,
             "user_input": user_input,
         }
         prior = list(state.get("stage_events") or [])
-        return {
-            "last_user_input": user_input,
-            "stage_events": [*prior, event],
-        }
+        updates["stage_events"] = [*prior, event]
+        return updates
 
     async def abefore_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
@@ -340,7 +380,7 @@ def create_input_stage_middleware(
     return InputStageMiddleware(debug=debug, on_input=on_input)
 
 
-OnPostStepCallback = Callable[[], None]
+OnPostStepCallback = Callable[[dict[str, Any]], None]
 
 
 class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
@@ -364,13 +404,19 @@ class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if not is_completed_tool_step(messages):
             return None
 
+        payload = build_post_step_payload(messages)
+
         if self._debug:
             emit_post_step_marker()
+            emit_stage_debug(STAGE_POST_STEP, payload)
 
         if self._on_post_step is not None:
-            self._on_post_step()
+            self._on_post_step(payload)
 
-        event: StageEvent = {"stage": STAGE_POST_STEP}
+        event: StageEvent = {
+            "stage": STAGE_POST_STEP,
+            "invocations": payload["invocations"],
+        }
         prior = list(state.get("stage_events") or [])
         return {"stage_events": [*prior, event]}
 

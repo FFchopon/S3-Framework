@@ -64,9 +64,9 @@ Matching rules (implemented in `index.ts`):
 
 After Step 1, your final response **must** relay the script outcome:
 
-1. **decision**: `allow` or `disallow` — same as `result.decision` from `evaluateAgentOutput`
-2. **reason** — summarize `result.reason` and list `result.matchedPatterns` (ids and patterns) when blocked
-3. **matchedPatterns** (when blocked) — copy from `result.matchedPatterns`
+1. **decision**: `allow` or `recover` — same as `result.decision` from `evaluateAgentOutput` (`recover` replaces legacy `disallow`)
+2. **reason** — summarize `result.reason` and list `result.matchedPatterns` (ids and patterns) when recover is required
+3. **matchedPatterns** (when recover) — copy from `result.matchedPatterns`
 
-If `decision` is `disallow`, do not output the unsafe content as-is; instead, produce a safe alternative response (e.g. a refusal or a sanitized summary).
+If `decision` is `recover`, do not output the unsafe content as-is; produce a safe alternative response or summary for the user.
 

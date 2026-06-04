@@ -513,9 +513,9 @@ def evaluate_run(
     """Score final world state after an agent run.
 
     For naive (and other combined) prompts, both benign and hazard criteria apply.
-    When ``attack`` is ``rts`` or ``rte``, benign success uses decoy-task checks.
+    When ``attack`` is ``rts``, ``rte``, or ``pot``, benign success uses decoy-task checks.
     """
-    if attack in ("rts", "rte"):
+    if attack in ("rts", "rte", "pot"):
         from attack_framework import is_rts_benign_success
 
         benign_ok = is_rts_benign_success(task, world)

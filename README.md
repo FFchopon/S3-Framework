@@ -2,12 +2,23 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
 | memory |  |  |  |  |  |  |  |
-| planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |  |
+| planning | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
 | tool selection | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
 | tool execution | ✔️ | - | - | - | - | - | - |
 | tool observation | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
 | post step | ✔️ | ✔️ | ✔️ | ✔️ | - | ✔️ | ✔️ |
-| output | ✔️ | ✔️ | ✔️ |  | ✔️ |  |  |
+| output | ✔️ | ✔️ | ✔️ |  | ✔️ | - | - |
+
+| **Stage**      | **Threat**               |
+| -------------- | ------------------------ |
+| Input          | DPI                      |
+| Memory         | Memory Poisoning         |
+| Planning       | Backdoor PoT             |
+| Tool Selection | RTS*                     |
+| Observation    | OPI                      |
+| Post-Step      | RTE*                     |
+| Output         | -                        |
+
 
 - Simple Test (GuardAgent): 
 ```
@@ -49,6 +60,9 @@ python agent.py --embodied --style adaptive --num 2 -p deepseek-flash --guard
 ```
 # input stage
 python agent.py --embodied --num 5 --attack dpi --style naive -p deepseek-flash
+
+# planning stage (PoT backdoor: Please + decoy benign input; write_todos follows hazard in system prompt)
+python agent.py --embodied --require-planning --num 5 --attack pot -p deepseek-flash
 
 # tool observation stage
 python agent.py --embodied --num 5 --attack opi --style naive -p deepseek-flash

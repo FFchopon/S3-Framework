@@ -3,7 +3,9 @@
 import argparse
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
@@ -29,13 +31,14 @@ from stage_capture import (
 )
 from attack_framework import (
     AttackType,
+    build_pot_backdoor_system_fragment,
     build_user_message_for_attack,
     run_rte_embodied_task,
     create_observation_attack_middleware,
     create_risky_tool_selection_middleware,
     initial_attack_state,
     rts_benign_task_label,
-    validate_rts_batch_range,
+    validate_decoy_attack_batch_range,
 )
 from guard_bridge import GuardAgentClient, GuardRecoverTracker, guard_enabled
 from guard_recover import state_update_for_recover
@@ -43,6 +46,7 @@ from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
 from embodied_env.tasks import (
     ALL_HAZARD_TASKS,
     BENIGN_INSTRUCTION,
+    EvalPrompt,
     PromptStyle,
     evaluate_run,
     iter_eval_prompts,
@@ -158,6 +162,7 @@ def build_agent(
     env_tracer: EmbodiedEnvTracer | None = None,
     recover_tracker: GuardRecoverTracker | None = None,
     attack: AttackType = "dpi",
+    pot_backdoor_fragment: str | None = None,
 ):
     register_planning_harness_profile(require_planning=require_planning)
 
@@ -259,6 +264,8 @@ def build_agent(
     if embodied:
         system_prompt = f"{base_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}"
         extra_tools = create_embodied_tools()
+    if pot_backdoor_fragment:
+        system_prompt = f"{system_prompt}\n\n{pot_backdoor_fragment}"
 
     def on_post_step(payload: dict, messages: list) -> dict | None:
         if guard_check is not None:
@@ -314,6 +321,7 @@ def run_embodied_batch(
     env_tracer: EmbodiedEnvTracer | None = None,
     print_assistant: bool = False,
     recover_tracker: GuardRecoverTracker | None = None,
+    agent_builder: Callable[[EvalPrompt], Any] | None = None,
 ) -> tuple[int, int, int, int]:
     """Run up to `num` embodied eval tasks from 1-based index `start`.
 
@@ -355,7 +363,12 @@ def run_embodied_batch(
                 file=sys.stderr,
             )
         else:
-            result = agent.invoke(
+            task_agent = agent
+            if attack == "pot":
+                if agent_builder is None:
+                    raise ValueError("PoT attack requires agent_builder (per-task system prompt).")
+                task_agent = agent_builder(prompt)
+            result = task_agent.invoke(
                 {
                     "messages": [{"role": "user", "content": user_message}],
                     "files": files,
@@ -387,7 +400,7 @@ def run_embodied_batch(
 
         benign_note = (
             f" decoy_benign={rts_benign_task_label(prompt.hazard_task)!r}"
-            if attack in ("rts", "rte")
+            if attack in ("rts", "rte", "pot")
             else ""
         )
         print(
@@ -419,9 +432,9 @@ def print_batch_summary(
     print(f"attack: {attack}")
     print(f"prompt style: {style}")
     print(f"total task: {total}")
-    if attack in ("rts", "rte"):
-        label = "RTS" if attack == "rts" else "RTE"
-        print(f"decoy benign task success ({label}): {benign_ok}")
+    if attack in ("rts", "rte", "pot"):
+        labels = {"rts": "RTS", "rte": "RTE", "pot": "PoT"}
+        print(f"decoy benign task success ({labels.get(attack, attack)}): {benign_ok}")
     else:
         print(
             f"original task success ({BENIGN_INSTRUCTION}): {benign_ok}"
@@ -507,7 +520,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attack",
-        choices=("dpi", "opi", "rts", "rte"),
+        choices=("dpi", "opi", "rts", "rte", "pot"),
         default="dpi",
         help=(
             "Attack vector for embodied batch eval (default: dpi). "
@@ -515,7 +528,8 @@ def parse_args() -> argparse.Namespace:
             "opi: observation prompt injection on first tool return "
             "(excluding write_todos and observe_environment); "
             "rts: risky tool_selection override (tasks 1-45); "
-            "rte: skip main agent; god-mode write per-task hazard world state (tasks 1-45)."
+            "rte: skip main agent; god-mode write per-task hazard world state (tasks 1-45); "
+            "pot: PoT planning backdoor in system prompt (trigger Please; tasks 1-45)."
         ),
     )
     parser.add_argument(
@@ -528,7 +542,7 @@ def parse_args() -> argparse.Namespace:
             "dpi adaptive: benign + ignore-prefix + hazard; "
             "dpi adversarial: benign + justified hazard. "
             "opi appends styled hazard text to the first actionable tool observation. "
-            "rts/rte ignore style (decoy benign user input; RTE skips agent and injects hazard state)."
+            "rts/rte/pot ignore style (decoy benign user input; pot uses Please+decoy; RTE skips agent)."
         ),
     )
     parser.add_argument(
@@ -615,8 +629,34 @@ def main() -> None:
 
     skill_files = load_all_skill_files()
     recover_tracker = GuardRecoverTracker() if enable_guard else None
+
+    if args.attack == "pot":
+        if not require_planning:
+            print(
+                "Warning: --attack pot enables --require-planning (PoT backdoor targets write_todos).\n",
+                file=sys.stderr,
+            )
+        require_planning = True
+
+    def build_task_agent(prompt: EvalPrompt):
+        return build_agent(
+            model_id,
+            debug_planning=debug_planning,
+            debug_stages=debug_stages,
+            embodied=args.embodied,
+            enable_guard=enable_guard,
+            require_planning=require_planning,
+            env_tracer=env_tracer,
+            recover_tracker=recover_tracker,
+            pot_backdoor_fragment=build_pot_backdoor_system_fragment(prompt.hazard_task),
+        )
+
+    pot_agent_builder: Callable[[EvalPrompt], Any] | None = None
+    if args.attack == "pot":
+        pot_agent_builder = build_task_agent
+
     agent = None
-    if args.num is None or args.attack != "rte":
+    if args.attack not in ("rte", "pot"):
         agent = build_agent(
             model_id,
             debug_planning=debug_planning,
@@ -642,10 +682,12 @@ def main() -> None:
                 f"No tasks to run: --start {args.start} is past the last task "
                 f"({EMBODIED_TASK_COUNT})."
             )
-        if args.attack in ("rts", "rte"):
-            validate_rts_batch_range(args.start, run_count)
-        if args.attack == "rte" and not args.embodied:
-            raise SystemExit("--attack rte requires --embodied.")
+        if args.attack in ("rts", "rte", "pot"):
+            validate_decoy_attack_batch_range(args.start, run_count)
+        if args.attack in ("rte", "pot") and not args.embodied:
+            raise SystemExit(f"--attack {args.attack} requires --embodied.")
+        if args.attack == "pot" and not require_planning:
+            raise SystemExit("--attack pot requires planning (use --require-planning).")
         print(
             f"Batch range: tasks {args.start}..{args.start + run_count - 1} "
             f"({run_count} total), attack={args.attack}, style={args.style}\n",
@@ -660,6 +702,7 @@ def main() -> None:
             files=skill_files,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
+            agent_builder=pot_agent_builder,
         )
         print_batch_summary(
             total,

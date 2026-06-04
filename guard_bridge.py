@@ -72,7 +72,7 @@ def _repo_root() -> Path:
 
 
 def _guard_agent_script() -> Path:
-    return _repo_root() / "GuardAgent" / "agent.py"
+    return _repo_root() / "guardagent" / "agent.py"
 
 
 def _stringify_payload(payload: Any) -> str:

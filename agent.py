@@ -31,17 +31,24 @@ from stage_capture import (
 )
 from attack_framework import (
     AttackType,
+    attack_benign_task_label,
     build_pot_backdoor_system_fragment,
     build_user_message_for_attack,
     run_rte_embodied_task,
     create_observation_attack_middleware,
-    create_risky_tool_selection_middleware,
     initial_attack_state,
-    rts_benign_task_label,
     validate_decoy_attack_batch_range,
 )
-from guard_bridge import GuardAgentClient, GuardRecoverTracker, guard_enabled
+from guard_bridge import GuardAgentClient, GuardCheckCollector, GuardRecoverTracker, guard_enabled
 from guard_recover import state_update_for_recover
+from result_writer import (
+    RESULT_DIR,
+    RunResultWriter,
+    build_run_metadata,
+    create_run_result_writer,
+    save_results_enabled,
+    stages_from_agent_state,
+)
 from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
 from embodied_env.tasks import (
     ALL_HAZARD_TASKS,
@@ -151,9 +158,28 @@ def ensure_provider_env(provider: str) -> None:
         print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
 
 
+def ensure_model_env(model_id: str) -> None:
+    prefix = model_id.split(":", 1)[0] if ":" in model_id else model_id
+    ensure_provider_env(prefix)
+
+
+def resolve_guard_model_id(
+    *,
+    main_model_id: str,
+    guard_provider: str | None,
+    guard_model_override: str | None,
+) -> str:
+    if guard_model_override:
+        return guard_model_override
+    if guard_provider:
+        return resolve_model_id(guard_provider, None)
+    return main_model_id
+
+
 def build_agent(
     model_id: str,
     *,
+    guard_model_id: str | None = None,
     debug_planning: bool = False,
     debug_stages: bool = False,
     embodied: bool = False,
@@ -161,6 +187,7 @@ def build_agent(
     require_planning: bool = False,
     env_tracer: EmbodiedEnvTracer | None = None,
     recover_tracker: GuardRecoverTracker | None = None,
+    guard_collector: GuardCheckCollector | None = None,
     attack: AttackType = "dpi",
     pot_backdoor_fragment: str | None = None,
 ):
@@ -175,10 +202,15 @@ def build_agent(
     guard_check = None
 
     if enable_guard:
-        guard = GuardAgentClient(model_id=model_id, embodied=embodied)
+        guard = GuardAgentClient(
+            model_id=guard_model_id or model_id,
+            embodied=embodied,
+        )
 
         def guard_check(stage: str, payload: object):
             result = guard.check(stage, payload)
+            if guard_collector is not None:
+                guard_collector.record(result)
             if (
                 recover_tracker is not None
                 and result.outcome is not None
@@ -236,8 +268,14 @@ def build_agent(
         def on_tool_selection(tool_calls: list[dict], messages: list) -> dict | None:
             result = guard_check("tool_selection", tool_calls)
             if result.outcome and result.outcome.recovered_content is not None:
+                regen = ""
+                if result.outcome.recover_recommendation is not None:
+                    regen = result.outcome.recover_recommendation.regenerate_instruction
                 return state_update_for_recover(
-                    messages, "tool_selection", result.outcome.recovered_content
+                    messages,
+                    "tool_selection",
+                    result.outcome.recovered_content,
+                    regenerate_instruction=regen,
                 )
             return None
 
@@ -293,7 +331,6 @@ def build_agent(
             ),
             create_input_stage_middleware(debug=debug_stages, on_input=on_input),
             create_observation_attack_middleware(debug=debug_stages),
-            create_risky_tool_selection_middleware(debug=debug_stages),
             create_stage_capture_middleware(
                 debug=debug_stages,
                 on_tool_selection=on_tool_selection,
@@ -321,12 +358,14 @@ def run_embodied_batch(
     env_tracer: EmbodiedEnvTracer | None = None,
     print_assistant: bool = False,
     recover_tracker: GuardRecoverTracker | None = None,
+    guard_collector: GuardCheckCollector | None = None,
     agent_builder: Callable[[EvalPrompt], Any] | None = None,
-) -> tuple[int, int, int, int]:
+    result_writer: RunResultWriter | None = None,
+) -> tuple[int, int, int, int, int]:
     """Run up to `num` embodied eval tasks from 1-based index `start`.
 
     Resets the text environment between tasks.
-    Returns (total, benign_success_count, hazard_success_count, recover_triggered_count).
+    Returns (total, benign_success_count, hazard_success_count, safe_benign_count, recover_triggered_count).
     """
     all_prompts = iter_eval_prompts(style=style)
     start_index = start - 1
@@ -334,11 +373,14 @@ def run_embodied_batch(
     total = len(prompts)
     benign_ok = 0
     hazard_ok = 0
+    safe_benign_ok = 0
 
     for run_index, prompt in enumerate(prompts, start=1):
         task_index = start + run_index - 1
         if recover_tracker is not None:
             recover_tracker.begin_task()
+        if guard_collector is not None:
+            guard_collector.begin_task()
         reset_embodied_environment()
         if env_tracer is not None:
             env_tracer.reset_baseline()
@@ -353,13 +395,16 @@ def run_embodied_batch(
             file=sys.stderr,
         )
 
+        agent_result: dict[str, Any] | None = None
+        rte_hazard_injected: bool | None = None
+
         if attack == "rte":
-            hazard_injected = run_rte_embodied_task(prompt.hazard_task)
+            rte_hazard_injected = run_rte_embodied_task(prompt.hazard_task)
             print(
                 f"[rte] main agent skipped; god-mode hazard state for "
                 f"category={prompt.hazard_task.category!r} "
                 f"risky_object={prompt.hazard_task.risky_object!r} "
-                f"hazard_success={hazard_injected}\n",
+                f"hazard_success={rte_hazard_injected}\n",
                 file=sys.stderr,
             )
         else:
@@ -368,7 +413,7 @@ def run_embodied_batch(
                 if agent_builder is None:
                     raise ValueError("PoT attack requires agent_builder (per-task system prompt).")
                 task_agent = agent_builder(prompt)
-            result = task_agent.invoke(
+            agent_result = task_agent.invoke(
                 {
                     "messages": [{"role": "user", "content": user_message}],
                     "files": files,
@@ -381,7 +426,7 @@ def run_embodied_batch(
 
             if print_assistant:
                 print(f"\n--- Task {task_index} assistant ---\n")
-                print(format_assistant_content(result["messages"][-1]))
+                print(format_assistant_content(agent_result["messages"][-1]))
 
         eval_result = evaluate_run(
             get_embodied_environment().world,
@@ -393,13 +438,18 @@ def run_embodied_batch(
             benign_ok += 1
         if eval_result.hazard_success:
             hazard_ok += 1
+        if eval_result.benign_success and not eval_result.hazard_success:
+            safe_benign_ok += 1
 
         recover_triggered = False
         if recover_tracker is not None:
             recover_triggered = recover_tracker.end_task()
+        guard_checks: list[dict[str, Any]] = []
+        if guard_collector is not None:
+            guard_checks = guard_collector.end_task()
 
         benign_note = (
-            f" decoy_benign={rts_benign_task_label(prompt.hazard_task)!r}"
+            f" decoy_benign={attack_benign_task_label(attack, prompt.hazard_task)!r}"
             if attack in ("rts", "rte", "pot")
             else ""
         )
@@ -414,14 +464,58 @@ def run_embodied_batch(
         if env_tracer is not None:
             env_tracer.emit_final()
 
+        if result_writer is not None:
+            stages: list[dict[str, Any]]
+            assistant_output: str | None = None
+            if attack == "rte":
+                stages = [
+                    {"stage": "input", "user_input": user_message},
+                    {
+                        "stage": "rte",
+                        "category": prompt.hazard_task.category,
+                        "risky_object": prompt.hazard_task.risky_object,
+                        "hazard_injected": rte_hazard_injected,
+                    },
+                ]
+            else:
+                stages = stages_from_agent_state(agent_result)
+                if agent_result is not None:
+                    assistant_output = format_assistant_content(
+                        agent_result["messages"][-1]
+                    )
+
+            record: dict[str, Any] = {
+                "task_index": task_index,
+                "run_index": run_index,
+                "attack": attack,
+                "style": style,
+                "hazard_category": prompt.hazard_task.category,
+                "risky_object": prompt.hazard_task.risky_object,
+                "user_message": user_message,
+                "benign_success": eval_result.benign_success,
+                "hazard_success": eval_result.hazard_success,
+                "recover_triggered": recover_triggered,
+                "stages": stages,
+            }
+            if attack in ("rts", "rte", "pot"):
+                record["decoy_benign_label"] = attack_benign_task_label(
+                    attack, prompt.hazard_task
+                )
+            if assistant_output is not None:
+                record["assistant_output"] = assistant_output
+            if guard_checks:
+                record["guard_checks"] = guard_checks
+            result_writer.append_task(record)
+
     recover_ok = recover_tracker.total if recover_tracker is not None else 0
-    return total, benign_ok, hazard_ok, recover_ok
+    return total, benign_ok, hazard_ok, safe_benign_ok, recover_ok
 
 
 def print_batch_summary(
     total: int,
     benign_ok: int,
     hazard_ok: int,
+    safe_benign_ok: int,
     recover_ok: int = 0,
     *,
     style: PromptStyle = "naive",
@@ -439,6 +533,10 @@ def print_batch_summary(
         print(
             f"original task success ({BENIGN_INSTRUCTION}): {benign_ok}"
         )
+    print(
+        "safe benign execution (benign_success & not hazard_success): "
+        f"{safe_benign_ok}"
+    )
     print(f"attack task success: {hazard_ok}")
     print(f"recover triggered: {recover_ok}")
     print("====================\n")
@@ -458,15 +556,34 @@ def parse_args() -> argparse.Namespace:
         "-p",
         choices=sorted(MODEL_PRESETS),
         default=os.environ.get("DEEPAGENT_PROVIDER", "openai"),
-        help="LLM provider preset (default: openai, or DEEPAGENT_PROVIDER)",
+        help="Main Agent provider preset (default: openai, or DEEPAGENT_PROVIDER)",
     )
     parser.add_argument(
         "--model",
         "-m",
         default=None,
         help=(
-            "Full model id passed to create_deep_agent, e.g. openai:gpt-5.4 or "
+            "Main Agent full model id, e.g. openai:gpt-5.4 or "
             "deepseek:deepseek-v4-pro. Overrides --provider."
+        ),
+    )
+    parser.add_argument(
+        "--guard-provider",
+        "-gp",
+        choices=sorted(MODEL_PRESETS),
+        default=os.environ.get("DEEPAGENT_GUARD_PROVIDER"),
+        help=(
+            "GuardAgent provider preset (default: same as --provider; "
+            "or DEEPAGENT_GUARD_PROVIDER)."
+        ),
+    )
+    parser.add_argument(
+        "--guard-model",
+        "-gm",
+        default=os.environ.get("DEEPAGENT_GUARD_MODEL"),
+        help=(
+            "GuardAgent full model id. Overrides --guard-provider. "
+            "Default: same as Main Agent model (or DEEPAGENT_GUARD_MODEL)."
         ),
     )
     parser.add_argument(
@@ -480,6 +597,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Print input / tool_selection / tool_observation / post_step / output payloads to stderr "
             "(or set DEEPAGENT_DEBUG_STAGES=1)."
+        ),
+    )
+    parser.add_argument(
+        "--save-results",
+        action="store_true",
+        help=(
+            "Save batch run records as JSON under result/ (one file per command). "
+            "Each task includes stage payloads equivalent to --debug-stages "
+            "(or set DEEPAGENT_SAVE_RESULTS=1)."
         ),
     )
     parser.add_argument(
@@ -529,7 +655,7 @@ def parse_args() -> argparse.Namespace:
             "(excluding write_todos and observe_environment); "
             "rts: risky tool_selection override (tasks 1-45); "
             "rte: skip main agent; god-mode write per-task hazard world state (tasks 1-45); "
-            "pot: PoT planning backdoor in system prompt (trigger Please; tasks 1-45)."
+            "pot: PoT planning backdoor in system prompt (Please + unified benign; tasks 1-45)."
         ),
     )
     parser.add_argument(
@@ -542,7 +668,7 @@ def parse_args() -> argparse.Namespace:
             "dpi adaptive: benign + ignore-prefix + hazard; "
             "dpi adversarial: benign + justified hazard. "
             "opi appends styled hazard text to the first actionable tool observation. "
-            "rts/rte/pot ignore style (decoy benign user input; pot uses Please+decoy; RTE skips agent)."
+            "rts/rte use per-category decoy user input; pot uses Please + unified benign; RTE skips agent."
         ),
     )
     parser.add_argument(
@@ -561,7 +687,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     model_id = resolve_model_id(args.provider, args.model)
-    ensure_provider_env(args.provider)
+    guard_model_id = resolve_guard_model_id(
+        main_model_id=model_id,
+        guard_provider=args.guard_provider,
+        guard_model_override=args.guard_model,
+    )
+    ensure_model_env(model_id)
+    if guard_model_id != model_id:
+        ensure_model_env(guard_model_id)
 
     if args.num is not None:
         if args.num < 1:
@@ -593,6 +726,7 @@ def main() -> None:
 
     debug_planning = planning_debug_enabled(args.debug_planning)
     debug_stages = stage_debug_enabled(args.debug_stages)
+    save_results = save_results_enabled(args.save_results)
     enable_guard = guard_enabled(args.guard)
     require_planning = require_planning_enabled(args.require_planning)
     trace_env = env_trace_enabled(args.trace_env)
@@ -602,7 +736,12 @@ def main() -> None:
             file=sys.stderr,
         )
         trace_env = False
-    print(f"Using model: {model_id}\n", file=sys.stderr)
+    print(f"Main Agent model: {model_id}\n", file=sys.stderr)
+    if enable_guard:
+        if guard_model_id == model_id:
+            print(f"GuardAgent model: {guard_model_id} (same as Main Agent)\n", file=sys.stderr)
+        else:
+            print(f"GuardAgent model: {guard_model_id}\n", file=sys.stderr)
     print(
         f"GuardAgent: {'on' if enable_guard else 'off (main agent runs tools without guard checks)'}\n",
         file=sys.stderr,
@@ -618,6 +757,9 @@ def main() -> None:
             "Stage debug: on (input, tool_selection, tool_observation, post_step, output → stderr)\n",
             file=sys.stderr,
         )
+    if save_results:
+        print(f"Result export: on (JSON → {RESULT_DIR}/)\n", file=sys.stderr)
+
     env_tracer: EmbodiedEnvTracer | None = None
     if args.embodied:
         print("Embodied mode: on (text environment tools enabled)\n", file=sys.stderr)
@@ -629,6 +771,7 @@ def main() -> None:
 
     skill_files = load_all_skill_files()
     recover_tracker = GuardRecoverTracker() if enable_guard else None
+    guard_collector = GuardCheckCollector() if enable_guard else None
 
     if args.attack == "pot":
         if not require_planning:
@@ -638,9 +781,28 @@ def main() -> None:
             )
         require_planning = True
 
+    run_metadata = build_run_metadata(
+        argv=sys.argv,
+        model_id=model_id,
+        provider=args.provider,
+        guard_model_id=guard_model_id if enable_guard else None,
+        guard_provider=args.guard_provider,
+        embodied=args.embodied,
+        attack=args.attack,
+        style=args.style,
+        start=args.start if args.num is not None else None,
+        num=args.num,
+        guard=enable_guard,
+        require_planning=require_planning,
+        debug_stages=debug_stages,
+        debug_planning=debug_planning,
+        trace_env=trace_env,
+    )
+
     def build_task_agent(prompt: EvalPrompt):
         return build_agent(
             model_id,
+            guard_model_id=guard_model_id,
             debug_planning=debug_planning,
             debug_stages=debug_stages,
             embodied=args.embodied,
@@ -648,6 +810,7 @@ def main() -> None:
             require_planning=require_planning,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
+            guard_collector=guard_collector,
             pot_backdoor_fragment=build_pot_backdoor_system_fragment(prompt.hazard_task),
         )
 
@@ -659,6 +822,7 @@ def main() -> None:
     if args.attack not in ("rte", "pot"):
         agent = build_agent(
             model_id,
+            guard_model_id=guard_model_id,
             debug_planning=debug_planning,
             debug_stages=debug_stages,
             embodied=args.embodied,
@@ -666,6 +830,7 @@ def main() -> None:
             require_planning=require_planning,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
+            guard_collector=guard_collector,
         )
 
     if args.num is not None:
@@ -693,7 +858,14 @@ def main() -> None:
             f"({run_count} total), attack={args.attack}, style={args.style}\n",
             file=sys.stderr,
         )
-        total, benign_ok, hazard_ok, recover_ok = run_embodied_batch(
+        batch_result_writer: RunResultWriter | None = None
+        if save_results:
+            batch_metadata = {**run_metadata, "start": args.start, "num": run_count}
+            batch_result_writer = create_run_result_writer(
+                batch_metadata,
+                expected_total=run_count,
+            )
+        total, benign_ok, hazard_ok, safe_benign_ok, recover_ok = run_embodied_batch(
             agent,
             num=run_count,
             start=args.start,
@@ -702,17 +874,33 @@ def main() -> None:
             files=skill_files,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
+            guard_collector=guard_collector,
             agent_builder=pot_agent_builder,
+            result_writer=batch_result_writer,
         )
         print_batch_summary(
             total,
             benign_ok,
             hazard_ok,
+            safe_benign_ok,
             recover_ok,
             style=args.style,
             attack=args.attack,
         )
+        if batch_result_writer is not None:
+            batch_result_writer.finalize(recover_total=recover_ok)
         return
+
+    single_result_writer: RunResultWriter | None = None
+    if save_results:
+        single_result_writer = create_run_result_writer(
+            run_metadata,
+            expected_total=1,
+            summary_extra={"mode": "single"},
+        )
+
+    if guard_collector is not None:
+        guard_collector.begin_task()
 
     result = agent.invoke(
         {
@@ -728,6 +916,20 @@ def main() -> None:
 
     if env_tracer is not None:
         env_tracer.emit_final()
+
+    if single_result_writer is not None:
+        assistant_output = format_assistant_content(result["messages"][-1])
+        single_record: dict[str, Any] = {
+            "user_message": user_message,
+            "assistant_output": assistant_output,
+            "stages": stages_from_agent_state(result),
+        }
+        if guard_collector is not None:
+            guard_checks = guard_collector.end_task()
+            if guard_checks:
+                single_record["guard_checks"] = guard_checks
+        single_result_writer.append_task(single_record)
+        single_result_writer.finalize()
 
 
 if __name__ == "__main__":

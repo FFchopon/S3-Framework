@@ -14,6 +14,7 @@ import sys
 from collections.abc import Callable
 from typing import Any, NotRequired, TypedDict
 
+from guard_recover import apply_tool_selection_recover_continuation
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
@@ -245,24 +246,62 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         self._on_tool_observation = on_tool_observation
         self._on_planning = on_planning
 
+    @hook_config(can_jump_to=["model"])
     def after_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
-        messages = state.get("messages") or []
+        messages = list(state.get("messages") or [])
         pending = extract_pending_tool_selection(messages)
         if not pending:
             return None
+
+        from attack_framework import try_apply_rts_tool_selection
+
+        messages, pending, rts_event, rts_updates = try_apply_rts_tool_selection(
+            state, messages, debug=self._debug
+        )
 
         if self._debug:
             emit_stage_debug(STAGE_TOOL_SELECTION, pending)
 
         updates: dict[str, Any] = {
             "last_tool_selection": pending,
+            **rts_updates,
         }
+        prior = list(state.get("stage_events") or [])
+        if rts_event is not None:
+            prior = [*prior, rts_event]
+
+        retry_selection = False
+        regenerate_instruction = ""
         if self._on_tool_selection is not None:
             patch = self._on_tool_selection(pending, messages)
             if patch:
+                regenerate_instruction = str(patch.get("guard_regenerate_instruction") or "")
+                patch = {
+                    key: value
+                    for key, value in patch.items()
+                    if key != "guard_regenerate_instruction"
+                }
                 updates.update(patch)
+                patched_messages = updates.get("messages", messages)
+                if isinstance(patched_messages, list):
+                    messages = patched_messages
+                recovered_pending = extract_pending_tool_selection(messages)
+                if recovered_pending:
+                    pending = recovered_pending
+                    updates["last_tool_selection"] = pending
+                else:
+                    messages, pending, retry_selection = (
+                        apply_tool_selection_recover_continuation(
+                            messages,
+                            regenerate_instruction=regenerate_instruction,
+                        )
+                    )
+                    updates["messages"] = messages
+                    updates["last_tool_selection"] = pending
+                    if retry_selection:
+                        updates["jump_to"] = "model"
 
         # planning: write_todos tool call args contain the natural-language plan todos
         if self._on_planning is not None:
@@ -279,7 +318,6 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             "stage": STAGE_TOOL_SELECTION,
             "tool_calls": pending,
         }
-        prior = list(state.get("stage_events") or [])
         updates["stage_events"] = [*prior, event]
         return updates
 

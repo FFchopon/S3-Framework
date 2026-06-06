@@ -41,4 +41,6 @@ export type EvaluateToolSelectionResult = {
   unmatchedTools: string[];
   blocked: boolean;
   violations: PredicateViolation[];
+  decision: "allow" | "recover";
+  reason: string;
 };

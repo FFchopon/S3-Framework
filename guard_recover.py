@@ -13,6 +13,7 @@ GuardDecision = Literal["allow", "recover"]
 
 _RE_DECISION = re.compile(
     r'"decision"\s*:\s*"(allow|recover|disallow)"'
+    r'|\*\*decision\*\*\s*(?:[:：]|[-—–])\s*`?(allow|recover|disallow)`?'
     r'|decision\s*[:=]\s*`?(allow|recover|disallow)`?',
     re.IGNORECASE,
 )
@@ -24,12 +25,18 @@ _RE_SANITIZED = re.compile(
 _RECOVER_CONTENT_BEGIN = "===RECOVER_CONTENT_BEGIN==="
 _RECOVER_CONTENT_END = "===RECOVER_CONTENT_END==="
 
+TOOL_SELECTION_RECOVER_CONTINUE_MSG = (
+    "[Guard — tool_selection recover]\n"
+    "Unsafe tool call(s) were removed. Continue the benign task using only safe tool calls."
+)
+
 @dataclass(frozen=True)
 class RecoverRecommendation:
     risk_summary: str
     triggered_pattern: str
     evidence: str = ""
     remediate_steps: tuple[dict[str, Any], ...] = ()
+    regenerate_instruction: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -37,6 +44,8 @@ class RecoverRecommendation:
             "triggered_pattern": self.triggered_pattern,
             "evidence": self.evidence,
         }
+        if self.regenerate_instruction:
+            data["regenerate_instruction"] = self.regenerate_instruction
         if self.remediate_steps:
             data["remediate_steps"] = list(self.remediate_steps)
         return data
@@ -95,6 +104,31 @@ def _parse_post_step_recover_json(text: str) -> RecoverRecommendation | None:
     return None
 
 
+def _extract_markdown_field(text: str, label: str) -> str:
+    """Parse **Label**: value or **Label** — value from Guard stage skill output."""
+    pattern = (
+        rf"(?:^|\n)\s*(?:[-*]\s*)?"
+        rf"\*\*{re.escape(label)}\*\*"
+        rf"\s*(?:[:：]|[-—–])\s*"
+        rf"(.+?)(?=\n\s*(?:[-*]\s*)?\*\*|\n## |\Z)"
+    )
+    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_regenerate_instruction(text: str) -> str:
+    for label in (
+        "Regenerate instruction",
+        "Regenerate instructions",
+        "Guiding Instructions",
+        "Guiding Instruction",
+    ):
+        value = _extract_markdown_field(text, label)
+        if value:
+            return value
+    return ""
+
+
 def parse_recover_recommendation(text: str) -> RecoverRecommendation | None:
     post_step = _parse_post_step_recover_json(text)
     if post_step is not None and (
@@ -102,23 +136,19 @@ def parse_recover_recommendation(text: str) -> RecoverRecommendation | None:
     ):
         return post_step
 
-    if "recover recommendation" not in text.lower():
-        return None
-
-    def _field(label: str) -> str:
-        pattern = rf"\*\*{re.escape(label)}\*\*\s*[:：]\s*(.+?)(?=\n\*\*|\n## |\Z)"
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        return match.group(1).strip() if match else ""
-
-    risk = _field("Risk Summary")
-    triggered = _field("Triggered Pattern")
-    evidence = _field("Evidence")
-    if not risk and not triggered:
+    risk = _extract_markdown_field(text, "Risk Summary")
+    triggered = _extract_markdown_field(text, "Triggered Pattern")
+    evidence = _extract_markdown_field(text, "Evidence")
+    regenerate = _extract_regenerate_instruction(text)
+    has_recover_section = "recover recommendation" in text.lower()
+    has_recover_fields = bool(risk or triggered or evidence or regenerate)
+    if not has_recover_section and not has_recover_fields:
         return None
     return RecoverRecommendation(
         risk_summary=risk or "Risk detected at this pipeline stage.",
         triggered_pattern=triggered or "Remove the flagged risk content from the original payload.",
         evidence=evidence,
+        regenerate_instruction=regenerate,
     )
 
 
@@ -128,7 +158,7 @@ def parse_guard_stage_outcome(content: str) -> GuardStageOutcome:
     decision: GuardDecision = "allow"
 
     for match in _RE_DECISION.finditer(text):
-        value = (match.group(1) or match.group(2) or "").lower()
+        value = (match.group(1) or match.group(2) or match.group(3) or "").lower()
         if value == "disallow":
             decision = "recover"
         elif value == "recover":
@@ -143,8 +173,14 @@ def parse_guard_stage_outcome(content: str) -> GuardStageOutcome:
             decision = "recover"
 
     recommendation = parse_recover_recommendation(text) if decision == "recover" else None
-    reason_match = re.search(r"\*\*reason\*\*\s*[:：]\s*(.+?)(?=\n\*\*|\n## |\Z)", text, re.I | re.S)
+    reason_match = re.search(
+        r"\*\*reason\*\*\s*(?:[:：]|[-—–])\s*(.+?)(?=\n\s*(?:[-*]\s*)?\*\*|\n## |\Z)",
+        text,
+        re.I | re.S,
+    )
     reason = reason_match.group(1).strip() if reason_match else ""
+    if not reason and recommendation and recommendation.risk_summary:
+        reason = recommendation.risk_summary
 
     return GuardStageOutcome(
         decision=decision,
@@ -154,35 +190,102 @@ def parse_guard_stage_outcome(content: str) -> GuardStageOutcome:
     )
 
 
-def parse_recover_skill_output(content: str) -> Any | None:
-    """Extract sanitized_content from recover skill response."""
-    for match in _RE_JSON_BLOCK.finditer(content):
+@dataclass(frozen=True)
+class RecoverSkillResult:
+    sanitized_content: Any | None = None
+    regenerate_instruction: str = ""
+    removal_summary: str = ""
+    recovered: bool | None = None
+
+
+def _recover_skill_result_from_dict(data: dict[str, Any]) -> RecoverSkillResult:
+    regen = str(
+        data.get("regenerate_instruction")
+        or data.get("regenerate_instructions")
+        or data.get("guiding_instructions")
+        or data.get("guiding_instruction")
+        or ""
+    )
+    return RecoverSkillResult(
+        sanitized_content=data.get("sanitized_content"),
+        regenerate_instruction=regen,
+        removal_summary=str(data.get("removal_summary", "")),
+        recovered=data.get("recovered") if "recovered" in data else None,
+    )
+
+
+def parse_recover_skill_result(content: str) -> RecoverSkillResult:
+    """Parse recover skill JSON/text for sanitized_content and regenerate instructions."""
+    text = content.strip()
+    for match in _RE_JSON_BLOCK.finditer(text):
         try:
             data = json.loads(match.group(1))
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and "sanitized_content" in data:
-            return data["sanitized_content"]
+        if isinstance(data, dict) and (
+            "sanitized_content" in data
+            or "regenerate_instruction" in data
+            or "regenerate_instructions" in data
+            or "guiding_instructions" in data
+        ):
+            return _recover_skill_result_from_dict(data)
 
-    sanitized_match = _RE_SANITIZED.search(content)
+    sanitized_match = _RE_SANITIZED.search(text)
     if sanitized_match:
         raw = sanitized_match.group(1)
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return _recover_skill_result_from_dict(parsed)
+            return RecoverSkillResult(sanitized_content=parsed)
         except json.JSONDecodeError:
-            return raw.strip('"')
+            return RecoverSkillResult(sanitized_content=raw.strip('"'))
 
-    begin = content.find(_RECOVER_CONTENT_BEGIN)
-    end = content.find(_RECOVER_CONTENT_END)
+    begin = text.find(_RECOVER_CONTENT_BEGIN)
+    end = text.find(_RECOVER_CONTENT_END)
     if begin != -1 and end != -1:
-        block = content[begin + len(_RECOVER_CONTENT_BEGIN) : end].strip()
+        block = text[begin + len(_RECOVER_CONTENT_BEGIN) : end].strip()
         try:
             data = json.loads(block)
-            if isinstance(data, dict) and "sanitized_content" in data:
-                return data["sanitized_content"]
+            if isinstance(data, dict):
+                return _recover_skill_result_from_dict(data)
         except json.JSONDecodeError:
             pass
-    return None
+
+    regenerate = _extract_regenerate_instruction(text)
+    if regenerate:
+        return RecoverSkillResult(regenerate_instruction=regenerate)
+    return RecoverSkillResult()
+
+
+def parse_recover_skill_output(content: str) -> Any | None:
+    """Extract sanitized_content from recover skill response."""
+    return parse_recover_skill_result(content).sanitized_content
+
+
+def merge_recover_recommendation(
+    recommendation: RecoverRecommendation | None,
+    *,
+    regenerate_instruction: str = "",
+) -> RecoverRecommendation | None:
+    regen = regenerate_instruction.strip()
+    if recommendation is None:
+        if not regen:
+            return None
+        return RecoverRecommendation(
+            risk_summary="Risk detected at this pipeline stage.",
+            triggered_pattern="Remove the flagged risk content from the original payload.",
+            regenerate_instruction=regen,
+        )
+    if regen and not recommendation.regenerate_instruction:
+        return RecoverRecommendation(
+            risk_summary=recommendation.risk_summary,
+            triggered_pattern=recommendation.triggered_pattern,
+            evidence=recommendation.evidence,
+            remediate_steps=recommendation.remediate_steps,
+            regenerate_instruction=regen,
+        )
+    return recommendation
 
 
 def extract_recover_content_from_stderr(stderr: str) -> dict[str, Any] | None:
@@ -458,13 +561,32 @@ def _replace_pending_tool_calls(
                 )
             updated = list(messages)
             updated[index] = AIMessage(
-                content=msg.content,
+                content="" if not new_calls else msg.content,
                 tool_calls=new_calls,
                 id=msg.id,
                 name=msg.name,
             )
             return updated
     return messages
+
+
+def apply_tool_selection_recover_continuation(
+    messages: list[AnyMessage],
+    *,
+    regenerate_instruction: str = "",
+) -> tuple[list[AnyMessage], list[dict[str, Any]], bool]:
+    """When recover clears pending tool calls, nudge Main Agent to regenerate selection."""
+    from stage_capture import extract_pending_tool_selection
+
+    pending = extract_pending_tool_selection(messages)
+    if pending:
+        return messages, pending, False
+
+    notice_body = regenerate_instruction.strip() or TOOL_SELECTION_RECOVER_CONTINUE_MSG
+    if not notice_body.startswith("[Guard"):
+        notice_body = f"[Guard — tool_selection recover]\n{notice_body}"
+    notice = HumanMessage(content=notice_body)
+    return [*messages, notice], [], True
 
 
 def _replace_write_todos_args(
@@ -508,9 +630,21 @@ def apply_recover_patch(messages: list[AnyMessage], patch: RecoverPatch) -> list
 
 
 def state_update_for_recover(
-    messages: list[AnyMessage], stage: str, content: Any
+    messages: list[AnyMessage],
+    stage: str,
+    content: Any,
+    *,
+    regenerate_instruction: str = "",
 ) -> dict[str, Any] | None:
     updated = apply_recover_patch(messages, RecoverPatch(stage=stage, content=content))
     if updated == messages:
         return None
-    return {"messages": updated}
+    patch: dict[str, Any] = {"messages": updated}
+    if (
+        stage == "tool_selection"
+        and isinstance(content, list)
+        and not content
+        and regenerate_instruction.strip()
+    ):
+        patch["guard_regenerate_instruction"] = regenerate_instruction.strip()
+    return patch

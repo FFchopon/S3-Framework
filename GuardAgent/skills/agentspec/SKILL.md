@@ -65,27 +65,26 @@ const step2 = evaluateToolSelection(toolCalls, rulesJsonText);
 step2;
 ```
 
-### Step 3 — Final decision (model)
-
-If `step2.blocked` is true, the final decision must be `recover` and you must explain which rule(s) were violated. The recover skill will remove unsafe tool calls from the selection.
+`step2.decision` and `step2.reason` are derived only from predicate evaluation — do not re-decide in the model.
 
 ## Output format
 
-After completing the workflow, your final response **must** include:
+Report the Step 2 script outcome as your final response. Copy **`decision`** from `step2.decision` (`allow` or `recover`) — do not override the script.
 
-1. **decision**: `allow` or `recover`
-   - Use `allow` only when no predicate violation is detected.
-   - Use `recover` when any predicate violation is detected.
+If **`decision` is `recover`**, add a **Recover Recommendation** with:
 
-2. **reason**: 2–3 sentences explaining the decision
-   - Reference matched tools, activated rules, and violated predicates (or why the selection is acceptable).
+- **Risk Summary** — why the pending tool selection is unsafe (brief; use `step2.reason` and `step2.violations`)
+- **Triggered Pattern** — which tool call(s) or args must be removed or rewritten (name the tool, args, and rule id when known)
+- **Regenerate instruction** — If `pending` is empty after recovery, instruct agent to regenerate tool selection.
 
-## Recover Recommendation
+Example:
 
-When **decision** is `recover`, include:
+```text
+**decision**: recover
 
-- **Risk Summary**: Why the pending tool selection is unsafe.
-- **Triggered Pattern**: Which tool call(s) or args must be removed or rewritten.
-- **Evidence** (optional): rule ids, `step2.violations`, and affected tool names.
+- **Risk Summary**: Predicate violation in tool selection (see step2.reason): put fork into microwave is hazardous.
+- **Triggered Pattern**: remove put call with args {"item": "fork", "target": "microwave"} (rule block_put_metal_into_microwave)
+- **Regenerate instruction**:  Tool selection failed in the previous step — the `put(fork, microwave)` call was blocked for safety. The Main Agent should regenerate its tool selection without this call..
+```
 
-The **recover** skill returns a sanitized tool call list as `sanitized_content`.
+Do not return a sanitized tool call list here; the **recover** skill produces `sanitized_content`.

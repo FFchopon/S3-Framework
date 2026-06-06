@@ -19,8 +19,10 @@ from guard_recover import (
     build_recover_prompt,
     extract_original_content,
     extract_recover_content_from_stderr,
+    merge_recover_recommendation,
     parse_guard_stage_outcome,
     parse_recover_skill_output,
+    parse_recover_skill_result,
 )
 
 _BEGIN = "===================="
@@ -65,6 +67,54 @@ class GuardRecoverTracker:
             self.total += 1
         self._current_task = False
         return triggered
+
+
+def guard_check_result_to_record(result: GuardCheckResult) -> dict[str, Any]:
+    """Serialize a Guard check (+ recover when run) for JSON result export."""
+    outcome = result.outcome
+    decision = outcome.decision if outcome is not None else "allow"
+    record: dict[str, Any] = {
+        "stage": result.stage,
+        "ok": result.ok,
+        "decision": decision,
+    }
+    if outcome is not None and outcome.reason:
+        record["reason"] = outcome.reason
+    if outcome is not None and outcome.recover_recommendation is not None:
+        record["recover_recommendation"] = outcome.recover_recommendation.to_dict()
+    if result.content.strip():
+        record["guard_content"] = result.content.strip()
+    if outcome is not None and decision == "recover":
+        recover_text = outcome.raw_content.strip()
+        if recover_text and recover_text != result.content.strip():
+            record["recover_content"] = recover_text
+    if outcome is not None and outcome.recovered_content is not None:
+        record["recovered_content"] = outcome.recovered_content
+    if result.remediation_actions:
+        record["remediation_actions"] = list(result.remediation_actions)
+    if result.halt_main_agent:
+        record["halt_main_agent"] = True
+    if result.embodied_world_applied:
+        record["embodied_world_applied"] = True
+    return record
+
+
+class GuardCheckCollector:
+    """Collect per-task Guard check / recover records for --save-results."""
+
+    def __init__(self) -> None:
+        self._checks: list[dict[str, Any]] = []
+
+    def begin_task(self) -> None:
+        self._checks = []
+
+    def record(self, result: GuardCheckResult) -> None:
+        self._checks.append(guard_check_result_to_record(result))
+
+    def end_task(self) -> list[dict[str, Any]]:
+        checks = self._checks
+        self._checks = []
+        return checks
 
 
 def _repo_root() -> Path:
@@ -315,17 +365,25 @@ class GuardAgentClient:
 
             _, recover_stdout, recover_stderr = self._invoke("recover", recover_message)
             recover_content = _extract_guard_result(recover_stdout)
-            recovered_content = parse_recover_skill_output(recover_content)
+            skill_result = parse_recover_skill_result(recover_content)
+            recovered_content = skill_result.sanitized_content
             if recovered_content is None:
                 recovered = extract_recover_content_from_stderr(recover_stderr)
                 if recovered:
                     recovered_content = recovered.get("sanitized_content")
+                    skill_result = parse_recover_skill_result(
+                        json.dumps(recovered, ensure_ascii=False, default=str)
+                    )
+            recommendation = merge_recover_recommendation(
+                outcome.recover_recommendation,
+                regenerate_instruction=skill_result.regenerate_instruction,
+            )
             if recovered_content is not None:
                 stderr = stderr + _emit_recover_content_marker(stage, recovered_content)
                 outcome = GuardStageOutcome(
                     decision="recover",
                     reason=outcome.reason,
-                    recover_recommendation=outcome.recover_recommendation,
+                    recover_recommendation=recommendation,
                     recovered_content=recovered_content,
                     raw_content=recover_content,
                 )

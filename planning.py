@@ -43,16 +43,6 @@ Follow this workflow for complex, multi-step requests:
 3. **Adapt**: Revise the todo list when new information changes the plan.
 4. **Deliver**: After all todos are complete, provide the final answer in a normal assistant message.
 
-## Skills
-
-When the user's task matches an available skill, that skill's `SKILL.md` (e.g. `/skills/<name>/SKILL.md`) is the source of truth for **what** to do: workflows, resources, tools, and output format. Execute from the document itself—numbered steps, checklists, code blocks—not from a separate "planning" section (skills do not need one).
-
-For complex skill-backed work:
-
-1. Call `write_todos` first with steps you can infer from skill metadata and the user request.
-2. `read_file` the skill's `SKILL.md` when you need the full procedure; revise the todo list so it reflects the workflow sections in that file.
-3. Complete todos by following the skill document.
-
 ## Planning rules
 
 - For **non-trivial** tasks, `write_todos` MUST be your **first** tool call.
@@ -95,7 +85,6 @@ Writing todos takes time and tokens, use it when it is helpful for managing comp
 
 - The `write_todos` tool should never be called multiple times in parallel.
 - Don't be afraid to revise the To-Do list as you go. New information may reveal new tasks that need to be done, or old tasks that are irrelevant.
-- After reading a skill's `SKILL.md`, update todos to match that file's workflow sections (not a dedicated planning chapter).
 
 ## Finishing a task
 
@@ -103,45 +92,17 @@ When you finish all work, write your final answer in the message AFTER your last
 """
 
 PLANNING_TODO_TOOL_DESCRIPTION = """\
-Use this tool to create and manage a structured task list for your current work session.
+Create and update a structured todo list for the current session.
 
-## Planning phase (required for complex work)
+**When required:** 3+ steps, multiple tools, or multiple user tasks — call this **first**, before any other tool. Mark the first item `in_progress`.
 
-If the task needs 3+ steps, multiple tools, or multiple user tasks: call `write_todos` **first**, before any other tool. List every step you will take; mark the first task `in_progress`.
+**When to skip:** trivial requests, fewer than 3 steps, or pure conversation — complete the task directly.
 
-Only use this tool if you think it will help you stay organized. If the user's request is trivial and takes less than 3 steps, do NOT use this tool and just do the task directly.
+**Usage:** Mark items `in_progress` before work and `completed` when fully done; revise the list as you learn more. Do not call `write_todos` in parallel. Do not edit completed items.
 
-## When to Use This Tool
+**States:** `pending` | `in_progress` | `completed`
 
-1. Complex multi-step tasks — When a task requires 3 or more distinct steps or actions
-2. Non-trivial tasks — Careful planning or multiple operations are needed
-3. User explicitly requests a todo list
-4. User provides multiple tasks
-5. The plan may need future revisions based on results from the first few steps
-6. The task matches a skill — infer initial todos from skill metadata, then read `SKILL.md` and align todos with its documented workflow
-
-## How to Use This Tool
-
-1. When you start working on a task — Mark it as in_progress BEFORE beginning work.
-2. After completing a task — Mark it as completed and add any new follow-up tasks discovered during implementation.
-3. You can also update future tasks. Don't change previously completed tasks.
-4. You can make several updates to the todo list at once.
-
-## When NOT to Use This Tool
-
-Skip when: single straightforward task, trivial request, fewer than 3 trivial steps, or purely conversational.
-
-## Task States
-
-- pending: not started
-- in_progress: currently working (keep at least one in_progress until all done)
-- completed: finished successfully — only when FULLY accomplished
-
-When you write the todo list, mark your first task(s) as in_progress immediately.
-
-## When You Finish
-
-`write_todos` tracks your work; it does not deliver the answer. The user's requested output must appear as text after your final `write_todos` call.
+**Finish:** Deliver the user's answer in a later assistant message, not in the same turn as your last `write_todos` call.
 """
 
 

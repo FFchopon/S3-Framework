@@ -54,14 +54,16 @@ python agent.py --embodied --style adversarial --num 45 -p deepseek
 - Run Batch (with Guard Agent)
 ```
 python agent.py --embodied --style adaptive --num 2 -p deepseek-flash --guard
+python agent.py --embodied --num 5 -p deepseek-flash --guard -gp openai -gm openai:gpt-5.4
 ```
+`-p`/`-m` set Main Agent; `-gp`/`-gm` set GuardAgent (default: same as Main Agent).
 
 - Attack Type
 ```
 # input stage
 python agent.py --embodied --num 5 --attack dpi --style naive -p deepseek-flash
 
-# planning stage (PoT backdoor: Please + decoy benign input; write_todos follows hazard in system prompt)
+# planning stage (PoT: Please + unified benign; write_todos also follows PoT objective in system prompt)
 python agent.py --embodied --require-planning --num 5 --attack pot -p deepseek-flash
 
 # tool observation stage
@@ -74,4 +76,17 @@ python agent.py --embodied --start 31 --num 5 --attack rts -p deepseek-flash
 
 # tool execution stage (RTE: skip main agent; god-mode per-task hazard state; decoy input label only)
 python agent.py --embodied --num 45 --attack rte -p deepseek-flash
+```
+
+- Save run results (one JSON file per command under `result/`)
+```
+python agent.py --embodied --start 1 --num 5 --attack dpi --save-results -p deepseek-flash
+```
+Each task record includes `stages` (same payloads as `--debug-stages`) plus eval outcomes.
+The JSON file is created at batch start and updated after each task completes.
+
+Summarize a saved result file:
+
+```
+python scripts/summarize_result.py result/20260606_030246_embodied_attack-pot_style-naive_tasks-11-45_deepseek-flash.json
 ```

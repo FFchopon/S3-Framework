@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage
 
 GuardDecision = Literal["allow", "recover"]
 
@@ -28,6 +28,11 @@ _RECOVER_CONTENT_END = "===RECOVER_CONTENT_END==="
 TOOL_SELECTION_RECOVER_CONTINUE_MSG = (
     "[Guard — tool_selection recover]\n"
     "Unsafe tool call(s) were removed. Continue the benign task using only safe tool calls."
+)
+
+PLANNING_RECOVER_CONTINUE_MSG = (
+    "[Guard — planning recover]\n"
+    "Unsafe plan step(s) were removed. Continue the benign task using only safe todos."
 )
 
 @dataclass(frozen=True)
@@ -544,49 +549,142 @@ def _replace_latest_tool_observations(
     return updated
 
 
+def _find_last_ai_with_tool_calls(messages: list[AnyMessage]) -> AIMessage | None:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and message.tool_calls:
+            return message
+    return None
+
+
+def apply_message_deltas(
+    messages: list[AnyMessage], deltas: list[AnyMessage]
+) -> list[AnyMessage]:
+    """Project message deltas onto a local copy (for pending extraction)."""
+    updated = list(messages)
+    for delta in deltas:
+        if isinstance(delta, RemoveMessage):
+            updated = [msg for msg in updated if getattr(msg, "id", None) != delta.id]
+            continue
+        if isinstance(delta, AIMessage) and delta.id:
+            replaced = False
+            for index, msg in enumerate(updated):
+                if isinstance(msg, AIMessage) and msg.id == delta.id:
+                    updated[index] = delta
+                    replaced = True
+                    break
+            if not replaced:
+                updated.append(delta)
+            continue
+        updated.append(delta)
+    return updated
+
+
+def _normalize_tool_call_entry(call: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": call.get("id", ""),
+        "name": call.get("name", ""),
+        "args": dict(call.get("args") or {}),
+        "type": "tool_call",
+    }
+
+
+def _strip_deepseek_reasoning_kwargs(msg: AIMessage) -> AIMessage:
+    """Drop reasoning_content so a modified assistant turn can be resent safely."""
+    extra = {
+        key: value
+        for key, value in msg.additional_kwargs.items()
+        if key != "reasoning_content"
+    }
+    return msg.model_copy(update={"additional_kwargs": extra})
+
+
+def _patch_ai_tool_calls(
+    msg: AIMessage,
+    tool_calls: list[dict[str, Any]],
+    *,
+    clear_content_when_empty: bool = True,
+) -> AIMessage:
+    """Patch tool_calls on an AIMessage without dropping DeepSeek reasoning metadata."""
+    new_calls = [_normalize_tool_call_entry(call) for call in tool_calls]
+    content = msg.content
+    if clear_content_when_empty and not new_calls:
+        content = ""
+    patched = msg.model_copy(update={"content": content, "tool_calls": new_calls})
+    # DeepSeek thinking mode requires reasoning_content when resubmitting an assistant
+    # message that originally had tool_calls but now has none. Prefer RemoveMessage
+    # in _tool_selection_recover_deltas; this fallback strips the field if we must patch.
+    if not new_calls and "reasoning_content" in patched.additional_kwargs:
+        patched = _strip_deepseek_reasoning_kwargs(patched)
+    return patched
+
+
+def _tool_selection_recover_deltas(
+    messages: list[AnyMessage], tool_calls: list[dict[str, Any]]
+) -> list[AnyMessage]:
+    ai = _find_last_ai_with_tool_calls(messages)
+    if ai is None:
+        return []
+    if not tool_calls and ai.id:
+        # Avoid resubmitting a thinking-mode assistant turn with empty tool_calls.
+        return [RemoveMessage(id=ai.id)]
+    return [_patch_ai_tool_calls(ai, tool_calls)]
+
+
 def _replace_pending_tool_calls(
     messages: list[AnyMessage], tool_calls: list[dict[str, Any]]
 ) -> list[AnyMessage]:
     for index in range(len(messages) - 1, -1, -1):
         if isinstance(messages[index], AIMessage) and messages[index].tool_calls:
             msg = messages[index]
-            new_calls = []
-            for call in tool_calls:
-                new_calls.append(
-                    {
-                        "id": call.get("id", ""),
-                        "name": call.get("name", ""),
-                        "args": dict(call.get("args") or {}),
-                    }
-                )
+            if not tool_calls and msg.id:
+                return [m for m in messages if getattr(m, "id", None) != msg.id]
             updated = list(messages)
-            updated[index] = AIMessage(
-                content="" if not new_calls else msg.content,
-                tool_calls=new_calls,
-                id=msg.id,
-                name=msg.name,
-            )
+            updated[index] = _patch_ai_tool_calls(msg, tool_calls)
             return updated
     return messages
+
+
+def build_planning_recover_notice(*, regenerate_instruction: str = "") -> str:
+    notice_body = regenerate_instruction.strip() or PLANNING_RECOVER_CONTINUE_MSG
+    if not notice_body.startswith("[Guard"):
+        notice_body = f"[Guard — planning recover]\n{notice_body}"
+    return notice_body
 
 
 def apply_tool_selection_recover_continuation(
     messages: list[AnyMessage],
     *,
     regenerate_instruction: str = "",
-) -> tuple[list[AnyMessage], list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, list[AnyMessage]]:
     """When recover clears pending tool calls, nudge Main Agent to regenerate selection."""
     from stage_capture import extract_pending_tool_selection
 
     pending = extract_pending_tool_selection(messages)
     if pending:
-        return messages, pending, False
+        return pending, False, []
 
     notice_body = regenerate_instruction.strip() or TOOL_SELECTION_RECOVER_CONTINUE_MSG
     if not notice_body.startswith("[Guard"):
         notice_body = f"[Guard — tool_selection recover]\n{notice_body}"
-    notice = HumanMessage(content=notice_body)
-    return [*messages, notice], [], True
+    return [], True, [HumanMessage(content=notice_body)]
+
+
+def _planning_recover_deltas(
+    messages: list[AnyMessage], todos: Any
+) -> list[AnyMessage]:
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], AIMessage) and messages[index].tool_calls:
+            msg = messages[index]
+            new_calls = []
+            for call in msg.tool_calls:
+                entry = dict(call)
+                if entry.get("name") == "write_todos":
+                    args = dict(entry.get("args") or {})
+                    args["todos"] = todos
+                    entry["args"] = args
+                new_calls.append(entry)
+            return [_patch_ai_tool_calls(msg, new_calls, clear_content_when_empty=False)]
+    return []
 
 
 def _replace_write_todos_args(
@@ -604,12 +702,7 @@ def _replace_write_todos_args(
                     entry["args"] = args
                 new_calls.append(entry)
             updated = list(messages)
-            updated[index] = AIMessage(
-                content=msg.content,
-                tool_calls=new_calls,
-                id=msg.id,
-                name=msg.name,
-            )
+            updated[index] = _patch_ai_tool_calls(msg, new_calls, clear_content_when_empty=False)
             return updated
     return messages
 
@@ -636,15 +729,25 @@ def state_update_for_recover(
     *,
     regenerate_instruction: str = "",
 ) -> dict[str, Any] | None:
+    if stage == "tool_selection" and isinstance(content, list):
+        deltas = _tool_selection_recover_deltas(messages, content)
+        if not deltas:
+            return None
+        patch: dict[str, Any] = {"messages": deltas}
+        if not content and regenerate_instruction.strip():
+            patch["guard_regenerate_instruction"] = regenerate_instruction.strip()
+        return patch
+
+    if stage == "planning":
+        deltas = _planning_recover_deltas(messages, content)
+        if not deltas:
+            return None
+        patch = {"messages": deltas}
+        if regenerate_instruction.strip():
+            patch["guard_regenerate_instruction"] = regenerate_instruction.strip()
+        return patch
+
     updated = apply_recover_patch(messages, RecoverPatch(stage=stage, content=content))
     if updated == messages:
         return None
-    patch: dict[str, Any] = {"messages": updated}
-    if (
-        stage == "tool_selection"
-        and isinstance(content, list)
-        and not content
-        and regenerate_instruction.strip()
-    ):
-        patch["guard_regenerate_instruction"] = regenerate_instruction.strip()
-    return patch
+    return {"messages": updated}

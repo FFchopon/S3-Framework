@@ -22,6 +22,7 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 STAGE_INPUT = "input"
 STAGE_PLANNING = "planning"
 STAGE_TOOL_OBSERVATION = "tool_observation"
+RECOVER_STAGE = "recover"
 
 KNOWN_STAGES = (
     STAGE_INPUT,
@@ -158,6 +159,12 @@ class StageSkillRegistry:
 
 def load_registry(skills_root: Path = SKILLS_ROOT) -> StageSkillRegistry:
     return StageSkillRegistry.from_skills_root(skills_root)
+
+
+def pipeline_guard_stages(skills_root: Path = SKILLS_ROOT) -> frozenset[str]:
+    """Pipeline stages with a safety skill (excludes recover — invoked only on recover flow)."""
+    registry = load_registry(skills_root)
+    return frozenset(stage for stage in registry.stages() if stage != RECOVER_STAGE)
 
 
 def list_skill_dirs(skills_root: Path = SKILLS_ROOT) -> list[Path]:

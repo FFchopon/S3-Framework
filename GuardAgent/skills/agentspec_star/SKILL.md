@@ -58,21 +58,23 @@ Apply **every** rule `check` to the plan content and decide whether the plan is 
 
 ## Output format
 
-Your final response must include:
+Report your Step 2 rule evaluation as your final response. Output **`decision`**: `allow` or `recover` based on whether any rule `check` is violated.
 
-1. **decision**: `allow` or `recover`
-   - Use `allow` only when the plan does not violate any rule check.
-   - Use `recover` when any rule check is violated or risk cannot be ruled out.
-2. **reason**: 2–3 sentences referencing the plan items and the most relevant rule checks
-3. **triggeredChecks**: list of rule ids that informed the decision
+If **`decision` is `recover`**, add a **Recover Recommendation** with:
 
-## Recover Recommendation
+- **Risk Summary** — why the plan/todos are unsafe (brief; cite violated rule ids and offending todo items)
+- **Triggered Pattern** — which todo item(s) or planned actions must be removed or rewritten (name the step content and rule id when known)
+- **Regenerate instruction** — instruct the Main Agent to regenerate the plan without the unsafe step(s).
 
-When **decision** is `recover`, include:
+Example:
 
-- **Risk Summary**: Why the generated plan/todos are unsafe.
-- **Triggered Pattern**: Which todo items or tool references must be removed from the plan.
-- **Evidence** (optional): violated rule ids and offending plan lines.
+```text
+**decision**: recover
 
-The **recover** skill returns sanitized todos as `sanitized_content`.
+- **Risk Summary**: Plan includes putting a metal fork into the microwave — fire/arcing hazard (rule check_put_metal_into_microwave).
+- **Triggered Pattern**: remove todo "Put fork into microwave and turn it on" (rule check_put_metal_into_microwave)
+- **Regenerate instruction**: Planning failed in the previous step — the plan step to put the fork into the microwave was blocked for safety. The Main Agent should regenerate its todo list without this step.
+```
+
+Do not return sanitized todos here; the **recover** skill produces `sanitized_content`.
 

@@ -69,28 +69,30 @@ export function matchBlockedPatterns(
 }
 
 /**
- * Full input guardrail: decision and reason derived only from pattern matching.
+ * Step 1 only: pattern-based decision. Step 2 safety analysis is performed by the Guard model (see SKILL.md).
  */
 export function evaluateUserInput(
   userInput: string,
   patternsJsonText: string,
 ): GuardrailEvaluation {
-  const result = matchBlockedPatterns(userInput, patternsJsonText);
+  const step1 = matchBlockedPatterns(userInput, patternsJsonText);
 
-  if (!result.blocked) {
+  if (step1.blocked) {
+    const ids = step1.matchedPatterns.map((m) => m.id).join(", ");
     return {
-      userInput: result.userInput,
-      decision: "allow",
-      reason: "No blocked patterns found in user input.",
-      matchedPatterns: [],
+      userInput: step1.userInput,
+      decision: "recover",
+      reason: `Blocked pattern(s) detected in user input: ${ids}.`,
+      matchedPatterns: step1.matchedPatterns,
+      step1,
     };
   }
 
-  const ids = result.matchedPatterns.map((m) => m.id).join(", ");
   return {
-    userInput: result.userInput,
-    decision: "recover",
-    reason: `Blocked pattern(s) detected in user input: ${ids}.`,
-    matchedPatterns: result.matchedPatterns,
+    userInput: step1.userInput,
+    decision: "allow",
+    reason: "No blocked patterns found in user input (Step 1). Proceed to Step 2 safety analysis.",
+    matchedPatterns: [],
+    step1,
   };
 }

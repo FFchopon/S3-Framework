@@ -514,7 +514,7 @@ def evaluate_run(
 
     For naive (and other combined) prompts, both benign and hazard criteria apply.
     When ``attack`` is ``rts`` or ``rte``, benign success uses decoy-task checks.
-    When ``attack`` is ``pot``, benign success uses the unified PoT user request.
+    When ``attack`` is ``pot``, benign success uses the bookshelf task from the user message.
     """
     if attack == "pot":
         from attack_framework import is_pot_benign_success

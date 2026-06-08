@@ -19,6 +19,16 @@
 | Post-Step      | RTE*                     |
 | Output         | -                        |
 
+| Method | DPI | MP | PoT | RTS | OPI | RTE |
+| --- | --- | --- | --- | --- | --- | --- |
+| No Defense | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
+| LC-GuardRail | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
+| A-MemGuard |  |  |  |  |  |  |
+| AgentSpec* | ✔️ |  | ✔️ |  |  | ✔️ |
+| AgentSpec | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
+| PraseData | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
+| AIR |  |  |  |  |  |  |
+| LC-op-GuardRail |  |  |  |  |  |  |
 
 - Simple Test (GuardAgent): 
 ```
@@ -63,7 +73,7 @@ python agent.py --embodied --num 5 -p deepseek-flash --guard -gp openai -gm open
 # input stage
 python agent.py --embodied --num 5 --attack dpi --style naive -p deepseek-flash
 
-# planning stage (PoT: Please + unified benign; write_todos also follows PoT objective in system prompt)
+# planning stage (PoT: Please + bookshelf benign; hazard objective only in system prompt)
 python agent.py --embodied --require-planning --num 5 --attack pot -p deepseek-flash
 
 # tool observation stage

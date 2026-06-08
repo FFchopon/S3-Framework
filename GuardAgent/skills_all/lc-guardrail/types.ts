@@ -19,9 +19,11 @@ export type MatchBlockedPatternsResult = {
   blocked: boolean;
 };
 
+/** Step 1 script result; Step 2 is model-only (see SKILL.md). */
 export type GuardrailEvaluation = {
   userInput: string;
   decision: "allow" | "recover";
   reason: string;
   matchedPatterns: MatchedBlockedPattern[];
+  step1: MatchBlockedPatternsResult;
 };

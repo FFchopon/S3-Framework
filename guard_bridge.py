@@ -38,12 +38,46 @@ _EMBODIED_WORLD_RE = re.compile(
 _RECOVER_STAGES = frozenset({"input", "planning", "tool_selection", "tool_observation"})
 # Embodied world is exported only from the recover subprocess (incident response).
 _EMBODIED_WORLD_APPLY_STAGES = frozenset({"recover"})
+_pipeline_guard_stages: frozenset[str] | None = None
 
 
 def guard_enabled(cli_flag: bool = False) -> bool:
     if cli_flag:
         return True
     return os.environ.get(GUARD_ENABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _guard_agent_dir() -> Path:
+    return _repo_root() / "GuardAgent"
+
+
+def _ensure_guard_agent_import_path() -> Path:
+    guard_dir = _guard_agent_dir()
+    guard_text = str(guard_dir)
+    if guard_text not in sys.path:
+        sys.path.insert(0, guard_text)
+    return guard_dir
+
+
+def load_pipeline_guard_stages(*, refresh: bool = False) -> frozenset[str]:
+    """Stages under GuardAgent/skills/ that expose a pipeline safety skill."""
+    global _pipeline_guard_stages
+    if _pipeline_guard_stages is not None and not refresh:
+        return _pipeline_guard_stages
+
+    guard_dir = _ensure_guard_agent_import_path()
+    from stage_skills import normalize_stage, pipeline_guard_stages
+
+    stages = pipeline_guard_stages(guard_dir / "skills")
+    _pipeline_guard_stages = frozenset(normalize_stage(stage) for stage in stages)
+    return _pipeline_guard_stages
+
+
+def stage_has_guard_skill(stage: str) -> bool:
+    registered = load_pipeline_guard_stages()
+    from stage_skills import normalize_stage
+
+    return normalize_stage(stage) in registered
 
 
 class GuardRecoverTracker:
@@ -193,6 +227,19 @@ class GuardCheckResult:
     embodied_world_applied: bool = False
     remediation_actions: tuple[str, ...] = ()
     halt_main_agent: bool = False
+    skipped: bool = False
+
+
+def _skip_guard_check_result(stage: str) -> GuardCheckResult:
+    return GuardCheckResult(
+        stage=stage,
+        ok=True,
+        stdout="",
+        stderr="",
+        content="",
+        outcome=GuardStageOutcome(decision="allow"),
+        skipped=True,
+    )
 
 
 def emit_incident_response_log(
@@ -254,6 +301,9 @@ class GuardAgentClient:
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     def check(self, stage: str, payload: Any) -> GuardCheckResult:
+        if not stage_has_guard_skill(stage):
+            return _skip_guard_check_result(stage)
+
         message_payload: Any = payload
         if self._embodied:
             message_payload = _wrap_embodied_payload(payload)

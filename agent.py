@@ -154,8 +154,12 @@ def resolve_model_id(provider: str, model_override: str | None) -> str:
 def ensure_provider_env(provider: str) -> None:
     if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
         print("Warning: OPENAI_API_KEY is not set.", file=sys.stderr)
-    if provider.startswith("deepseek") and not os.environ.get("DEEPSEEK_API_KEY"):
-        print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
+    if provider.startswith("deepseek"):
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
+        from deepseek_reasoning_patch import apply_deepseek_reasoning_payload_patch
+
+        apply_deepseek_reasoning_payload_patch()
 
 
 def ensure_model_env(model_id: str) -> None:
@@ -209,6 +213,8 @@ def build_agent(
 
         def guard_check(stage: str, payload: object):
             result = guard.check(stage, payload)
+            if result.skipped:
+                return result
             if guard_collector is not None:
                 guard_collector.record(result)
             if (
@@ -260,8 +266,14 @@ def build_agent(
         def on_planning(todos: object, messages: list) -> dict | None:
             result = guard_check("planning", todos)
             if result.outcome and result.outcome.recovered_content is not None:
+                regen = ""
+                if result.outcome.recover_recommendation is not None:
+                    regen = result.outcome.recover_recommendation.regenerate_instruction
                 return state_update_for_recover(
-                    messages, "planning", result.outcome.recovered_content
+                    messages,
+                    "planning",
+                    result.outcome.recovered_content,
+                    regenerate_instruction=regen,
                 )
             return None
 
@@ -655,7 +667,7 @@ def parse_args() -> argparse.Namespace:
             "(excluding write_todos and observe_environment); "
             "rts: risky tool_selection override (tasks 1-45); "
             "rte: skip main agent; god-mode write per-task hazard world state (tasks 1-45); "
-            "pot: PoT planning backdoor in system prompt (Please + unified benign; tasks 1-45)."
+            "pot: PoT planning backdoor in system prompt (Please + bookshelf benign; tasks 1-45)."
         ),
     )
     parser.add_argument(
@@ -668,7 +680,7 @@ def parse_args() -> argparse.Namespace:
             "dpi adaptive: benign + ignore-prefix + hazard; "
             "dpi adversarial: benign + justified hazard. "
             "opi appends styled hazard text to the first actionable tool observation. "
-            "rts/rte use per-category decoy user input; pot uses Please + unified benign; RTE skips agent."
+            "rts/rte use per-category decoy user input; pot uses Please + bookshelf benign; RTE skips agent."
         ),
     )
     parser.add_argument(

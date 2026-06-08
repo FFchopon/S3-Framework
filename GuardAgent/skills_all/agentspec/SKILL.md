@@ -84,7 +84,7 @@ Example:
 
 - **Risk Summary**: Predicate violation in tool selection (see step2.reason): put fork into microwave is hazardous.
 - **Triggered Pattern**: remove put call with args {"item": "fork", "target": "microwave"} (rule block_put_metal_into_microwave)
-- **Regenerate instruction**:  Tool selection failed in the previous step — the `put(fork, microwave)` call was blocked for safety. The Main Agent should regenerate its tool selection without this call..
+- **Regenerate instruction**: Tool selection failed in the previous step — the `put(fork, microwave)` call was blocked for safety. The Main Agent should regenerate its tool selection without this call.
 ```
 
 Do not return a sanitized tool call list here; the **recover** skill produces `sanitized_content`.

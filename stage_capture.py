@@ -14,7 +14,11 @@ import sys
 from collections.abc import Callable
 from typing import Any, NotRequired, TypedDict
 
-from guard_recover import apply_tool_selection_recover_continuation
+from guard_recover import (
+    apply_message_deltas,
+    apply_tool_selection_recover_continuation,
+    build_planning_recover_notice,
+)
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
@@ -68,6 +72,8 @@ class StageCaptureState(AgentState):
     opi_applied: NotRequired[bool]
     rts_hazard_task: NotRequired[dict[str, Any]]
     rts_applied: NotRequired[bool]
+    guard_planning_recover_pending: NotRequired[bool]
+    guard_planning_recover_notice: NotRequired[str]
 
 
 def stage_debug_enabled(cli_flag: bool = False) -> bool:
@@ -272,36 +278,41 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if rts_event is not None:
             prior = [*prior, rts_event]
 
-        retry_selection = False
         regenerate_instruction = ""
+        guard_recover_applied = False
+        message_deltas: list[AnyMessage] = []
         if self._on_tool_selection is not None:
             patch = self._on_tool_selection(pending, messages)
             if patch:
+                guard_recover_applied = True
                 regenerate_instruction = str(patch.get("guard_regenerate_instruction") or "")
-                patch = {
-                    key: value
-                    for key, value in patch.items()
-                    if key != "guard_regenerate_instruction"
-                }
-                updates.update(patch)
-                patched_messages = updates.get("messages", messages)
-                if isinstance(patched_messages, list):
-                    messages = patched_messages
-                recovered_pending = extract_pending_tool_selection(messages)
+                if patch.get("messages"):
+                    message_deltas.extend(patch["messages"])
+                updates.update(
+                    {
+                        key: value
+                        for key, value in patch.items()
+                        if key not in ("guard_regenerate_instruction", "messages")
+                    }
+                )
+                projected_messages = apply_message_deltas(messages, message_deltas)
+                recovered_pending = extract_pending_tool_selection(projected_messages)
                 if recovered_pending:
                     pending = recovered_pending
                     updates["last_tool_selection"] = pending
                 else:
-                    messages, pending, retry_selection = (
+                    pending, _, continuation_deltas = (
                         apply_tool_selection_recover_continuation(
-                            messages,
+                            projected_messages,
                             regenerate_instruction=regenerate_instruction,
                         )
                     )
-                    updates["messages"] = messages
+                    message_deltas.extend(continuation_deltas)
                     updates["last_tool_selection"] = pending
-                    if retry_selection:
-                        updates["jump_to"] = "model"
+
+        # Recover cleared all pending tool calls — never enter ToolNode this step.
+        if guard_recover_applied and not pending:
+            updates["jump_to"] = "model"
 
         # planning: write_todos tool call args contain the natural-language plan todos
         if self._on_planning is not None:
@@ -311,8 +322,33 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
                     if todos is not None:
                         plan_patch = self._on_planning(todos, messages)
                         if plan_patch:
-                            updates.update(plan_patch)
+                            planning_regenerate = str(
+                                plan_patch.get("guard_regenerate_instruction") or ""
+                            )
+                            if plan_patch.get("messages"):
+                                message_deltas.extend(plan_patch["messages"])
+                            updates["guard_planning_recover_pending"] = True
+                            updates["guard_planning_recover_notice"] = planning_regenerate
+                            updates.update(
+                                {
+                                    key: value
+                                    for key, value in plan_patch.items()
+                                    if key
+                                    not in (
+                                        "guard_regenerate_instruction",
+                                        "messages",
+                                    )
+                                }
+                            )
+                            projected_messages = apply_message_deltas(
+                                messages, message_deltas
+                            )
+                            pending = extract_pending_tool_selection(projected_messages)
+                            updates["last_tool_selection"] = pending
                     break
+
+        if message_deltas:
+            updates["messages"] = message_deltas
 
         event: StageEvent = {
             "stage": STAGE_TOOL_SELECTION,
@@ -330,28 +366,41 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
         messages = state.get("messages") or []
+        updates: dict[str, Any] = {}
+
+        if state.get("guard_planning_recover_pending") and is_completed_tool_step(messages):
+            invocations = extract_last_step_invocations(messages)
+            if any(inv.get("tool") == WRITE_TODOS_TOOL_NAME for inv in invocations):
+                notice = build_planning_recover_notice(
+                    regenerate_instruction=str(
+                        state.get("guard_planning_recover_notice") or ""
+                    )
+                )
+                updates["messages"] = [HumanMessage(content=notice)]
+                updates["guard_planning_recover_pending"] = False
+
         observations = extract_latest_tool_observations(messages)
-        if not observations:
+        if not observations and not updates:
             return None
 
-        if self._debug:
-            emit_stage_debug(STAGE_TOOL_OBSERVATION, observations)
+        if observations:
+            if self._debug:
+                emit_stage_debug(STAGE_TOOL_OBSERVATION, observations)
 
-        updates: dict[str, Any] = {
-            "last_tool_observations": observations,
-        }
-        if self._on_tool_observation is not None:
-            patch = self._on_tool_observation(observations, messages)
-            if patch:
-                updates.update(patch)
+            updates["last_tool_observations"] = observations
+            if self._on_tool_observation is not None:
+                patch = self._on_tool_observation(observations, messages)
+                if patch:
+                    updates.update(patch)
 
-        event: StageEvent = {
-            "stage": STAGE_TOOL_OBSERVATION,
-            "observations": observations,
-        }
-        prior = list(state.get("stage_events") or [])
-        updates["stage_events"] = [*prior, event]
-        return updates
+            event: StageEvent = {
+                "stage": STAGE_TOOL_OBSERVATION,
+                "observations": observations,
+            }
+            prior = list(state.get("stage_events") or [])
+            updates["stage_events"] = [*prior, event]
+
+        return updates or None
 
     async def abefore_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002

@@ -1,4 +1,5 @@
 - Implementation
+
 | **Stage** | **Implementation** | **Middleware** | **Safety Skill** | **Simple Test** | **Parameter Pass** | **Recover** | **Attack** |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
@@ -11,6 +12,7 @@
 | output | ✔️ | ✔️ | ✔️ |  | ✔️ | - | - |
 
 - Attack Type
+
 | **Stage**      | **Threat**               |
 | -------------- | ------------------------ |
 | Input          | DPI                      |
@@ -22,6 +24,7 @@
 | Output         | -                        |
 
 - Experiment Evaluation
+
 | Method | DPI | MP | PoT | RTS | OPI | RTE |
 | --- | --- | --- | --- | --- | --- | --- |
 | No Defense | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |

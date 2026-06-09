@@ -234,6 +234,11 @@ OnOutputCallback = Callable[[str], None]
 OnPlanningCallback = Callable[[Any, list[AnyMessage]], StageStateUpdate]
 
 
+def _apply_guard_incident_halt(updates: dict[str, Any]) -> None:
+    if updates.get("guard_incident_halt"):
+        updates["jump_to"] = "end"
+
+
 class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
     """Expose tool selection (after_model) and tool observation (before_model) in state."""
 
@@ -252,7 +257,7 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         self._on_tool_observation = on_tool_observation
         self._on_planning = on_planning
 
-    @hook_config(can_jump_to=["model"])
+    @hook_config(can_jump_to=["model", "end"])
     def after_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
@@ -314,6 +319,8 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if guard_recover_applied and not pending:
             updates["jump_to"] = "model"
 
+        _apply_guard_incident_halt(updates)
+
         # planning: write_todos tool call args contain the natural-language plan todos
         if self._on_planning is not None:
             for call in pending:
@@ -362,6 +369,7 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
     ) -> dict[str, Any] | None:
         return self.after_model(state, runtime)
 
+    @hook_config(can_jump_to=["end"])
     def before_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
@@ -400,6 +408,7 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             prior = list(state.get("stage_events") or [])
             updates["stage_events"] = [*prior, event]
 
+        _apply_guard_incident_halt(updates)
         return updates or None
 
     async def abefore_model(
@@ -432,6 +441,7 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         self._debug = debug
         self._on_input = on_input
 
+    @hook_config(can_jump_to=["end"])
     def before_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
@@ -459,6 +469,7 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         }
         prior = list(state.get("stage_events") or [])
         updates["stage_events"] = [*prior, event]
+        _apply_guard_incident_halt(updates)
         return updates
 
     async def abefore_model(

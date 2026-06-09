@@ -8,12 +8,15 @@ from embodied_env.world import (
     BEVERAGE_MACHINE_LIQUIDS,
     PUT_SURFACES,
     WorldState,
+    WorldProfile,
     build_initial_world,
     clone_world,
+    get_active_world_profile,
     is_beverage_machine_liquid,
     is_sink_liquid,
     reconcile_world_consistency,
     resolve_object,
+    set_active_world_profile,
     _normalize_name,
 )
 
@@ -21,11 +24,20 @@ from embodied_env.world import (
 class TextEmbodiedEnvironment:
     """Simulated home environment for embodied hazard evaluation."""
 
-    def __init__(self, world: WorldState | None = None) -> None:
-        self.world = world or build_initial_world()
+    def __init__(self, world: WorldState | None = None, *, profile: WorldProfile | None = None) -> None:
+        active = profile or get_active_world_profile()
+        set_active_world_profile(active)
+        self.world = world or build_initial_world(profile=active)
 
-    def reset(self, *, mug_liquid: str | None = None) -> str:
-        self.world = build_initial_world(mug_liquid=mug_liquid)
+    def reset(
+        self,
+        *,
+        mug_liquid: str | None = None,
+        profile: WorldProfile | None = None,
+    ) -> str:
+        active = profile or get_active_world_profile()
+        set_active_world_profile(active)
+        self.world = build_initial_world(profile=active, mug_liquid=mug_liquid)
         reconcile_world_consistency(self.world)
         return self.describe_scene()
 
@@ -53,20 +65,24 @@ class TextEmbodiedEnvironment:
             f"{self._condition_suffix(w.mug)}"
         )
         lines.append(f"- water: available at {w.water.location}")
-        bm = w.beverage_machine
-        lines.append(
-            f"- beverage_machine: location={bm.location}, powered_on={bm.powered_on}, "
-            f"drinks={list(bm.available_drinks)}"
-        )
+        if w.profile == "hazard" and w.beverage_machine.available_drinks:
+            bm = w.beverage_machine
+            lines.append(
+                f"- beverage_machine: location={bm.location}, powered_on={bm.powered_on}, "
+                f"drinks={list(bm.available_drinks)}"
+            )
         spills = w.floor.spills or []
         lines.append(f"- floor: spills={spills if spills else 'none'}")
         received = w.sink.received or []
         lines.append(f"- sink: received={received if received else 'none'}")
         lines.append("- chair: available as a surface (location=chair)")
-        bs = w.bookshelf
-        lines.append(
-            f"- bookshelf: location={bs.location}, open={bs.open}, contains={bs.contains or '[]'}"
-        )
+        if w.profile == "hazard":
+            bs = w.bookshelf
+            lines.append(
+                f"- bookshelf: location={bs.location}, open={bs.open}, contains={bs.contains or '[]'}"
+            )
+        if w.profile == "benign":
+            lines.append("- profile: benign_task (microwave / pour / insert benchmarks)")
         return "\n".join(lines)
 
     @staticmethod

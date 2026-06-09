@@ -49,21 +49,26 @@ from result_writer import (
     save_results_enabled,
     stages_from_agent_state,
 )
-from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
+from embodied_env.prompt import get_embodied_system_prompt
 from embodied_env.tasks import (
     ALL_HAZARD_TASKS,
     BENIGN_INSTRUCTION,
+    BENIGN_TASK_COUNT,
     EvalPrompt,
     PromptStyle,
+    evaluate_benign_run,
     evaluate_run,
+    iter_benign_tasks,
     iter_eval_prompts,
 )
 
 EMBODIED_TASK_COUNT = len(ALL_HAZARD_TASKS)
 from embodied_env.tools import (
+    benign_env_enabled,
     create_embodied_tools,
     get_embodied_environment,
     reset_embodied_environment,
+    set_benign_env_enabled,
 )
 from embodied_env.trace import EmbodiedEnvTracer, env_trace_enabled
 from skill_metadata_patch import (
@@ -187,6 +192,8 @@ def build_agent(
     debug_planning: bool = False,
     debug_stages: bool = False,
     embodied: bool = False,
+    benign_env: bool = False,
+    benign_task_mode: bool = False,
     enable_guard: bool = False,
     require_planning: bool = False,
     env_tracer: EmbodiedEnvTracer | None = None,
@@ -209,6 +216,7 @@ def build_agent(
         guard = GuardAgentClient(
             model_id=guard_model_id or model_id,
             embodied=embodied,
+            halt_on_recover=benign_task_mode,
         )
 
         def guard_check(stage: str, payload: object):
@@ -227,7 +235,9 @@ def build_agent(
                 print(f"\n[guard:{stage}]\n{result.content}\n", file=sys.stderr)
                 if result.outcome and result.outcome.decision == "recover":
                     extra = ""
-                    if stage in (
+                    if benign_task_mode or result.halt_main_agent:
+                        extra = " halt=True (benign task mode)"
+                    elif stage in (
                         "input",
                         "planning",
                         "tool_selection",
@@ -255,41 +265,35 @@ def build_agent(
                     )
             return result
 
-        def on_input(user_input: str, messages: list) -> dict | None:
-            result = guard_check("input", user_input)
+        def _guard_stage_patch(result, messages: list, *, regen: str = "") -> dict | None:
+            if result.halt_main_agent:
+                return {"guard_incident_halt": True}
             if result.outcome and result.outcome.recovered_content is not None:
                 return state_update_for_recover(
-                    messages, "input", result.outcome.recovered_content
+                    messages,
+                    result.stage,
+                    result.outcome.recovered_content,
+                    regenerate_instruction=regen,
                 )
             return None
+
+        def on_input(user_input: str, messages: list) -> dict | None:
+            result = guard_check("input", user_input)
+            return _guard_stage_patch(result, messages)
 
         def on_planning(todos: object, messages: list) -> dict | None:
             result = guard_check("planning", todos)
-            if result.outcome and result.outcome.recovered_content is not None:
-                regen = ""
-                if result.outcome.recover_recommendation is not None:
-                    regen = result.outcome.recover_recommendation.regenerate_instruction
-                return state_update_for_recover(
-                    messages,
-                    "planning",
-                    result.outcome.recovered_content,
-                    regenerate_instruction=regen,
-                )
-            return None
+            regen = ""
+            if result.outcome and result.outcome.recover_recommendation is not None:
+                regen = result.outcome.recover_recommendation.regenerate_instruction
+            return _guard_stage_patch(result, messages, regen=regen)
 
         def on_tool_selection(tool_calls: list[dict], messages: list) -> dict | None:
             result = guard_check("tool_selection", tool_calls)
-            if result.outcome and result.outcome.recovered_content is not None:
-                regen = ""
-                if result.outcome.recover_recommendation is not None:
-                    regen = result.outcome.recover_recommendation.regenerate_instruction
-                return state_update_for_recover(
-                    messages,
-                    "tool_selection",
-                    result.outcome.recovered_content,
-                    regenerate_instruction=regen,
-                )
-            return None
+            regen = ""
+            if result.outcome and result.outcome.recover_recommendation is not None:
+                regen = result.outcome.recover_recommendation.regenerate_instruction
+            return _guard_stage_patch(result, messages, regen=regen)
 
         def on_tool_observation(observations: list[dict], messages: list) -> dict | None:
             if len(observations) == 1 and isinstance(observations[0].get("content"), str):
@@ -297,11 +301,7 @@ def build_agent(
             else:
                 payload = observations
             result = guard_check("tool_observation", payload)
-            if result.outcome and result.outcome.recovered_content is not None:
-                return state_update_for_recover(
-                    messages, "tool_observation", result.outcome.recovered_content
-                )
-            return None
+            return _guard_stage_patch(result, messages)
 
         def on_output(model_output: str) -> None:
             guard_check("output", model_output)
@@ -312,7 +312,7 @@ def build_agent(
     system_prompt = base_prompt
     extra_tools: list = []
     if embodied:
-        system_prompt = f"{base_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}"
+        system_prompt = f"{base_prompt}\n\n{get_embodied_system_prompt('benign' if benign_env else 'hazard')}"
         extra_tools = create_embodied_tools()
     if pot_backdoor_fragment:
         system_prompt = f"{system_prompt}\n\n{pot_backdoor_fragment}"
@@ -523,6 +523,122 @@ def run_embodied_batch(
     return total, benign_ok, hazard_ok, safe_benign_ok, recover_ok
 
 
+def run_benign_batch(
+    agent,
+    *,
+    num: int,
+    start: int = 1,
+    files: dict,
+    env_tracer: EmbodiedEnvTracer | None = None,
+    print_assistant: bool = False,
+    recover_tracker: GuardRecoverTracker | None = None,
+    guard_collector: GuardCheckCollector | None = None,
+    result_writer: RunResultWriter | None = None,
+) -> tuple[int, int, int]:
+    """Run up to `num` standalone benign tasks from 1-based index `start`.
+
+    Returns (total, benign_success_count, recover_triggered_count).
+    """
+    all_tasks = iter_benign_tasks()
+    start_index = start - 1
+    tasks = all_tasks[start_index : start_index + num]
+    total = len(tasks)
+    benign_ok = 0
+    recover_ok = 0
+
+    for run_index, task in enumerate(tasks, start=1):
+        task_index = start + run_index - 1
+        if recover_tracker is not None:
+            recover_tracker.begin_task()
+        if guard_collector is not None:
+            guard_collector.begin_task()
+        reset_embodied_environment(benign_env=True)
+        if env_tracer is not None:
+            env_tracer.reset_baseline()
+
+        user_message = task.instruction
+        print(
+            f"\n[benign task {task_index}/{BENIGN_TASK_COUNT}, run {run_index}/{total}] "
+            f"category={task.category} target={task.target_object!r}\n"
+            f"user: {user_message}\n",
+            file=sys.stderr,
+        )
+
+        agent_result = agent.invoke(
+            {
+                "messages": [{"role": "user", "content": user_message}],
+                "files": files,
+            },
+            config={"configurable": {"thread_id": f"deepagent-benign-{task_index}"}},
+        )
+
+        if print_assistant:
+            print(f"\n--- Benign task {task_index} assistant ---\n")
+            print(format_assistant_content(agent_result["messages"][-1]))
+
+        recover_triggered = False
+        if recover_tracker is not None:
+            recover_triggered = recover_tracker.end_task()
+            if recover_triggered:
+                recover_ok += 1
+        guard_checks: list[dict[str, Any]] = []
+        if guard_collector is not None:
+            guard_checks = guard_collector.end_task()
+
+        eval_result = evaluate_benign_run(
+            get_embodied_environment().world,
+            task,
+            recover_triggered=recover_triggered,
+        )
+        if eval_result.benign_success:
+            benign_ok += 1
+
+        print(
+            f"[benign task {task_index}/{BENIGN_TASK_COUNT}, run {run_index}/{total}] "
+            f"benign_success={eval_result.benign_success} "
+            f"recover_triggered={recover_triggered}\n",
+            file=sys.stderr,
+        )
+
+        if env_tracer is not None:
+            env_tracer.emit_final()
+
+        if result_writer is not None:
+            record: dict[str, Any] = {
+                "task_index": task_index,
+                "run_index": run_index,
+                "mode": "benign",
+                "benign_category": task.category,
+                "target_object": task.target_object,
+                "user_message": user_message,
+                "benign_success": eval_result.benign_success,
+                "hazard_success": False,
+                "recover_triggered": recover_triggered,
+                "stages": stages_from_agent_state(agent_result),
+                "assistant_output": format_assistant_content(
+                    agent_result["messages"][-1]
+                ),
+            }
+            if guard_checks:
+                record["guard_checks"] = guard_checks
+            result_writer.append_task(record)
+
+    return total, benign_ok, recover_ok
+
+
+def print_benign_batch_summary(
+    total: int,
+    benign_ok: int,
+    recover_ok: int = 0,
+) -> None:
+    print("\n====================")
+    print("Benign batch evaluation summary")
+    print(f"total task: {total}")
+    print(f"benign task success: {benign_ok}")
+    print(f"recover triggered: {recover_ok}")
+    print("====================\n")
+
+
 def print_batch_summary(
     total: int,
     benign_ok: int,
@@ -626,6 +742,22 @@ def parse_args() -> argparse.Namespace:
         help="Enable text-simulated embodied environment tools (find, put, pour, fillliquid, insert).",
     )
     parser.add_argument(
+        "--benign-env",
+        action="store_true",
+        help=(
+            "Use the benign-task object layout (microwave / pour / insert benchmarks only; "
+            "default: off; or set DEEPAGENT_BENIGN_ENV=1)."
+        ),
+    )
+    parser.add_argument(
+        "--benign",
+        action="store_true",
+        help=(
+            "Run standalone benign embodied tasks (15 microwave / pour / insert benchmarks). "
+            "Implies --embodied and --benign-env. Use with --num and --start."
+        ),
+    )
+    parser.add_argument(
         "--guard",
         action="store_true",
         help="Enable GuardAgent stage checks (default: off; or set DEEPAGENT_ENABLE_GUARD=1).",
@@ -690,7 +822,8 @@ def parse_args() -> argparse.Namespace:
         metavar="K",
         help=(
             "1-based index of the first task in batch mode (default: 1). "
-            f"Valid range: 1..{EMBODIED_TASK_COUNT}. Use with --num."
+            f"Valid range: 1..{EMBODIED_TASK_COUNT} (hazard) or 1..{BENIGN_TASK_COUNT} (--benign). "
+            "Use with --num."
         ),
     )
     return parser.parse_args()
@@ -698,6 +831,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.benign:
+        args.embodied = True
+        args.benign_env = True
     model_id = resolve_model_id(args.provider, args.model)
     guard_model_id = resolve_guard_model_id(
         main_model_id=model_id,
@@ -713,16 +849,20 @@ def main() -> None:
             raise SystemExit("--num must be at least 1.")
         if args.start < 1:
             raise SystemExit("--start must be at least 1.")
-        if args.start > EMBODIED_TASK_COUNT:
+        task_count_limit = BENIGN_TASK_COUNT if args.benign else EMBODIED_TASK_COUNT
+        if args.start > task_count_limit:
             raise SystemExit(
-                f"--start must be at most {EMBODIED_TASK_COUNT} (got {args.start})."
+                f"--start must be at most {task_count_limit} (got {args.start})."
             )
         if not args.embodied:
             raise SystemExit("--num requires --embodied (text environment batch evaluation).")
-        print(
-            f"Attack: {args.attack} (style={args.style})\n",
-            file=sys.stderr,
-        )
+        if args.benign:
+            print("Mode: benign standalone tasks\n", file=sys.stderr)
+        else:
+            print(
+                f"Attack: {args.attack} (style={args.style})\n",
+                file=sys.stderr,
+            )
     elif args.start != 1:
         print(
             "Warning: --start is ignored without --num (not in batch mode).\n",
@@ -741,6 +881,7 @@ def main() -> None:
     save_results = save_results_enabled(args.save_results)
     enable_guard = guard_enabled(args.guard)
     require_planning = require_planning_enabled(args.require_planning)
+    benign_env = benign_env_enabled(args.benign_env)
     trace_env = env_trace_enabled(args.trace_env)
     if trace_env and not args.embodied:
         print(
@@ -774,8 +915,10 @@ def main() -> None:
 
     env_tracer: EmbodiedEnvTracer | None = None
     if args.embodied:
-        print("Embodied mode: on (text environment tools enabled)\n", file=sys.stderr)
-        reset_embodied_environment()
+        profile_label = "benign task" if benign_env else "hazard eval"
+        print(f"Embodied mode: on ({profile_label} object layout)\n", file=sys.stderr)
+        set_benign_env_enabled(benign_env)
+        reset_embodied_environment(benign_env=benign_env)
         if trace_env:
             print("Environment trace: on (per-step diff + final scene → stderr)\n", file=sys.stderr)
             env_tracer = EmbodiedEnvTracer()
@@ -800,6 +943,8 @@ def main() -> None:
         guard_model_id=guard_model_id if enable_guard else None,
         guard_provider=args.guard_provider,
         embodied=args.embodied,
+        benign_env=benign_env,
+        benign_tasks=args.benign,
         attack=args.attack,
         style=args.style,
         start=args.start if args.num is not None else None,
@@ -818,6 +963,7 @@ def main() -> None:
             debug_planning=debug_planning,
             debug_stages=debug_stages,
             embodied=args.embodied,
+            benign_env=benign_env,
             enable_guard=enable_guard,
             require_planning=require_planning,
             env_tracer=env_tracer,
@@ -831,13 +977,29 @@ def main() -> None:
         pot_agent_builder = build_task_agent
 
     agent = None
-    if args.attack not in ("rte", "pot"):
+    if args.benign:
+        agent = build_agent(
+            model_id,
+            guard_model_id=guard_model_id,
+            debug_planning=debug_planning,
+            debug_stages=debug_stages,
+            embodied=True,
+            benign_env=True,
+            benign_task_mode=True,
+            enable_guard=enable_guard,
+            require_planning=require_planning,
+            env_tracer=env_tracer,
+            recover_tracker=recover_tracker,
+            guard_collector=guard_collector,
+        )
+    elif args.attack not in ("rte", "pot"):
         agent = build_agent(
             model_id,
             guard_model_id=guard_model_id,
             debug_planning=debug_planning,
             debug_stages=debug_stages,
             embodied=args.embodied,
+            benign_env=benign_env,
             enable_guard=enable_guard,
             require_planning=require_planning,
             env_tracer=env_tracer,
@@ -846,7 +1008,8 @@ def main() -> None:
         )
 
     if args.num is not None:
-        remaining = EMBODIED_TASK_COUNT - args.start + 1
+        task_count_limit = BENIGN_TASK_COUNT if args.benign else EMBODIED_TASK_COUNT
+        remaining = task_count_limit - args.start + 1
         run_count = min(args.num, remaining)
         if args.num > remaining:
             print(
@@ -857,8 +1020,41 @@ def main() -> None:
         if run_count < 1:
             raise SystemExit(
                 f"No tasks to run: --start {args.start} is past the last task "
-                f"({EMBODIED_TASK_COUNT})."
+                f"({task_count_limit})."
             )
+        if args.benign:
+            print(
+                f"Benign batch range: tasks {args.start}..{args.start + run_count - 1} "
+                f"({run_count} total)\n",
+                file=sys.stderr,
+            )
+            batch_result_writer: RunResultWriter | None = None
+            if save_results:
+                batch_metadata = {
+                    **run_metadata,
+                    "start": args.start,
+                    "num": run_count,
+                    "mode": "benign",
+                }
+                batch_result_writer = create_run_result_writer(
+                    batch_metadata,
+                    expected_total=run_count,
+                    summary_extra={"mode": "benign"},
+                )
+            total, benign_ok, recover_ok = run_benign_batch(
+                agent,
+                num=run_count,
+                start=args.start,
+                files=skill_files,
+                env_tracer=env_tracer,
+                recover_tracker=recover_tracker,
+                guard_collector=guard_collector,
+                result_writer=batch_result_writer,
+            )
+            print_benign_batch_summary(total, benign_ok, recover_ok)
+            if batch_result_writer is not None:
+                batch_result_writer.finalize(recover_total=recover_ok)
+            return
         if args.attack in ("rts", "rte", "pot"):
             validate_decoy_attack_batch_range(args.start, run_count)
         if args.attack in ("rte", "pot") and not args.embodied:
@@ -901,6 +1097,33 @@ def main() -> None:
         )
         if batch_result_writer is not None:
             batch_result_writer.finalize(recover_total=recover_ok)
+        return
+
+    if args.benign:
+        if args.start > BENIGN_TASK_COUNT:
+            raise SystemExit(
+                f"--start must be at most {BENIGN_TASK_COUNT} (got {args.start})."
+            )
+        single_benign_writer: RunResultWriter | None = None
+        if save_results:
+            single_benign_writer = create_run_result_writer(
+                {**run_metadata, "start": args.start, "num": 1, "mode": "benign"},
+                expected_total=1,
+                summary_extra={"mode": "benign"},
+            )
+        total, benign_ok, recover_ok = run_benign_batch(
+            agent,
+            num=1,
+            start=args.start,
+            files=skill_files,
+            env_tracer=env_tracer,
+            recover_tracker=recover_tracker,
+            guard_collector=guard_collector,
+            result_writer=single_benign_writer,
+        )
+        print_benign_batch_summary(total, benign_ok, recover_ok)
+        if single_benign_writer is not None:
+            single_benign_writer.finalize(recover_total=recover_ok)
         return
 
     single_result_writer: RunResultWriter | None = None

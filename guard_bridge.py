@@ -275,9 +275,16 @@ def emit_incident_response_log(
 class GuardAgentClient:
     """Run GuardAgent as a subprocess for a given stage/payload."""
 
-    def __init__(self, *, model_id: str, embodied: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        embodied: bool = False,
+        halt_on_recover: bool = False,
+    ) -> None:
         self._model_id = model_id
         self._embodied = embodied
+        self._halt_on_recover = halt_on_recover
 
     def _invoke(self, stage: str, message: str) -> tuple[int, str, str]:
         script = _guard_agent_script()
@@ -349,7 +356,9 @@ class GuardAgentClient:
         recovered_content: Any | None = None
         remediation_actions: tuple[str, ...] = ()
         halt_main_agent = False
-        if outcome.decision == "recover" and stage == "post_step":
+        if outcome.decision == "recover" and self._halt_on_recover:
+            halt_main_agent = True
+        elif outcome.decision == "recover" and stage == "post_step":
             recommendation = outcome.recover_recommendation or RecoverRecommendation(
                 risk_summary=outcome.reason or "Incident detected in the last agent step.",
                 triggered_pattern="Execute remediate steps in the embodied environment.",

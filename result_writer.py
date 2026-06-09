@@ -87,6 +87,8 @@ def build_run_metadata(
     debug_stages: bool,
     debug_planning: bool,
     trace_env: bool,
+    benign_env: bool = False,
+    benign_tasks: bool = False,
 ) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -94,6 +96,8 @@ def build_run_metadata(
         "model": model_id,
         "provider": provider,
         "embodied": embodied,
+        "benign_env": benign_env,
+        "benign_tasks": benign_tasks,
         "attack": attack,
         "style": style,
         "start": start,
@@ -116,8 +120,15 @@ def build_result_filename(metadata: dict[str, Any], *, task_count: int) -> str:
     parts = [ts]
     if metadata.get("embodied"):
         parts.append("embodied")
-    parts.append(f"attack-{metadata.get('attack', 'none')}")
-    if metadata.get("embodied"):
+        if metadata.get("benign_tasks"):
+            parts.append("benign-tasks")
+        elif metadata.get("benign_env"):
+            parts.append("benign-env")
+    if metadata.get("benign_tasks"):
+        parts.append("mode-benign")
+    else:
+        parts.append(f"attack-{metadata.get('attack', 'none')}")
+    if metadata.get("embodied") and not metadata.get("benign_tasks"):
         parts.append(f"style-{metadata.get('style', 'naive')}")
     start = metadata.get("start")
     if start is not None:

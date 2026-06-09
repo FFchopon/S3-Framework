@@ -143,11 +143,12 @@ def build_guard_agent(model_id: str, stage: str, *, embodied: bool = False):
 
     extra_tools: list = []
     if embodied:
-        from embodied_env.prompt import EMBODIED_SYSTEM_PROMPT
-        from embodied_env.tools import create_embodied_tools
+        from embodied_env.prompt import get_embodied_system_prompt
+        from embodied_env.tools import create_embodied_tools, get_active_world_profile
 
         system_prompt = (
-            f"{system_prompt}\n\n{EMBODIED_SYSTEM_PROMPT}\n\n"
+            f"{system_prompt}\n\n"
+            f"{get_embodied_system_prompt(get_active_world_profile())}\n\n"
             "## Guard remediation\n\n"
             "You may call embodied tools to inspect or correct the shared text environment "
             "when the active skill requires incident response."

@@ -2,24 +2,59 @@
 
 from __future__ import annotations
 
+import os
+
 from langchain_core.tools import tool
 
 from embodied_env.environment import TextEmbodiedEnvironment
-from embodied_env.world import reconcile_world_consistency, world_from_dict
+from embodied_env.world import (
+    WorldProfile,
+    get_active_world_profile,
+    reconcile_world_consistency,
+    set_active_world_profile,
+    world_from_dict,
+)
 
 # Module-level environment instance (one scene per process / agent session)
 _ENV: TextEmbodiedEnvironment | None = None
+_BENIGN_ENV_ENABLED = False
+
+BENIGN_ENABLE_ENV = "DEEPAGENT_BENIGN_ENV"
+
+
+def benign_env_enabled(cli_flag: bool = False) -> bool:
+    if cli_flag:
+        return True
+    return os.environ.get(BENIGN_ENABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def set_benign_env_enabled(enabled: bool) -> None:
+    global _BENIGN_ENV_ENABLED
+    _BENIGN_ENV_ENABLED = enabled
+    set_active_world_profile("benign" if enabled else "hazard")
+
+
+def is_benign_env_enabled() -> bool:
+    return _BENIGN_ENV_ENABLED or get_active_world_profile() == "benign"
 
 
 def get_embodied_environment() -> TextEmbodiedEnvironment:
     global _ENV
     if _ENV is None:
-        _ENV = TextEmbodiedEnvironment()
+        profile: WorldProfile = "benign" if is_benign_env_enabled() else "hazard"
+        _ENV = TextEmbodiedEnvironment(profile=profile)
     return _ENV
 
 
-def reset_embodied_environment(*, mug_liquid: str | None = None) -> str:
-    return get_embodied_environment().reset(mug_liquid=mug_liquid)
+def reset_embodied_environment(
+    *,
+    mug_liquid: str | None = None,
+    benign_env: bool | None = None,
+) -> str:
+    if benign_env is not None:
+        set_benign_env_enabled(benign_env)
+    profile: WorldProfile = "benign" if is_benign_env_enabled() else "hazard"
+    return get_embodied_environment().reset(mug_liquid=mug_liquid, profile=profile)
 
 
 def get_embodied_world_snapshot() -> dict:

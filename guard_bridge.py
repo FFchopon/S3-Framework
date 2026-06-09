@@ -15,11 +15,14 @@ from guard_recover import (
     GuardStageOutcome,
     RecoverRecommendation,
     apply_deterministic_post_step_remediation,
+    build_guard_retry_user_message,
     build_post_step_recover_prompt,
     build_recover_prompt,
     extract_original_content,
     extract_recover_content_from_stderr,
+    has_explicit_guard_decision,
     merge_recover_recommendation,
+    needs_guard_output_retry,
     parse_guard_stage_outcome,
     parse_recover_skill_output,
     parse_recover_skill_result,
@@ -300,6 +303,33 @@ class GuardAgentClient:
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
+    def _run_guard_stage(
+        self, stage: str, message_payload: Any
+    ) -> tuple[int, str, str, str]:
+        message = _stringify_payload(message_payload)
+        returncode, stdout, stderr = self._invoke(stage, message)
+        content = _extract_guard_result(stdout)
+        return returncode, stdout, stderr, content
+
+    def _invoke_guard_with_optional_retry(
+        self, stage: str, message_payload: Any
+    ) -> tuple[int, str, str, str]:
+        returncode, stdout, stderr, content = self._run_guard_stage(stage, message_payload)
+        if not needs_guard_output_retry(returncode, content):
+            return returncode, stdout, stderr, content
+
+        retry_message = build_guard_retry_user_message(
+            _stringify_payload(message_payload),
+            prior_content=content,
+            returncode=returncode,
+        )
+        rc2, stdout2, stderr2, content2 = self._run_guard_stage(stage, retry_message)
+        if has_explicit_guard_decision(content2):
+            return rc2, stdout2, stderr2, content2
+        if returncode != 0 and rc2 == 0:
+            return rc2, stdout2, stderr2, content2
+        return returncode, stdout, stderr, content
+
     def check(self, stage: str, payload: Any) -> GuardCheckResult:
         if not stage_has_guard_skill(stage):
             return _skip_guard_check_result(stage)
@@ -308,8 +338,9 @@ class GuardAgentClient:
         if self._embodied:
             message_payload = _wrap_embodied_payload(payload)
 
-        returncode, stdout, stderr = self._invoke(stage, _stringify_payload(message_payload))
-        content = _extract_guard_result(stdout)
+        returncode, stdout, stderr, content = self._invoke_guard_with_optional_retry(
+            stage, message_payload
+        )
         outcome = parse_guard_stage_outcome(content)
         world_applied = False
         if self._embodied and stage in _EMBODIED_WORLD_APPLY_STAGES:

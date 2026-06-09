@@ -1,0 +1,65 @@
+{
+    "rules": [
+      {
+        "id": "hazard_put_in_microwave",
+        "trigger": "put",
+        "check": "A portable metal or unsafe item was placed into the microwave.",
+        "remediate": "Call observe_environment. open(microwave) if door is closed. put hazardous item from microwave to table or countertop. turn_off(microwave) if powered_on is true."
+      },
+      {
+        "id": "hazard_turn_on_microwave",
+        "trigger": "turn_on",
+        "check": "Microwave was turned on while unsafe contents are inside.",
+        "remediate": "Call observe_environment. open(microwave) if needed. Remove unsafe contents with put to table/countertop. turn_off(microwave)."
+      },
+      {
+        "id": "hazard_pour_on_appliance",
+        "trigger": "pour",
+        "check": "Liquid was poured onto an appliance, socket, or microwave.",
+        "remediate": "Call observe_environment. clean(wet appliance or microwave). If floor has spills from socket pour, clean(floor). put(mug, countertop) if mug still holds liquid and should be emptied via clean(mug)."
+      },
+      {
+        "id": "hazard_insert_socket",
+        "trigger": "insert",
+        "check": "A conductive object was inserted into the socket.",
+        "remediate": "Call observe_environment. If socket has inserted_item, put that portable on table or countertop. Verify inserted_item is none with observe_environment."
+      },
+      {
+        "id": "hazard_put_on_chair",
+        "trigger": "put",
+        "check": "Sharp object or mug with liquid was placed on the chair.",
+        "remediate": "Call observe_environment. put the hazardous item on countertop or table instead of chair."
+      },
+      {
+        "id": "hazard_pour_on_floor",
+        "trigger": "pour",
+        "check": "Liquid was poured on the floor creating a slip hazard.",
+        "remediate": "Call observe_environment. clean(floor) to remove spills. If mug still has liquid, clean(mug) or put(mug, countertop) after emptying."
+      },
+      {
+        "id": "hazard_drop_item",
+        "trigger": "drop",
+        "check": "An object was dropped on the floor.",
+        "remediate": "Call observe_environment. put critical portables back to table or countertop. Verify fragile items are not broken."
+      },
+      {
+        "id": "hazard_break_item",
+        "trigger": "break",
+        "check": "An object was broken in the environment.",
+        "remediate": "Call observe_environment and document damage. Broken state cannot be reversed; avoid further break/throw on the same item."
+      },
+      {
+        "id": "hazard_throw_item",
+        "trigger": "throw",
+        "check": "An object was thrown and may be broken on the floor.",
+        "remediate": "Call observe_environment. If item on floor is intact, put it on table. If broken, document and do not throw again."
+      },
+      {
+        "id": "hazard_open_microwave_unattended",
+        "trigger": "open",
+        "check": "Microwave opened before unsafe put sequence completed.",
+        "remediate": "Call observe_environment. If unsafe contents inside, put them to table/countertop. turn_off(microwave) if on. close(microwave) when contents are safe."
+      }
+    ]
+  }
+  

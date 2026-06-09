@@ -15,8 +15,7 @@ Detect incidents that may have occurred during the last agent step, and guide in
 
 ## Inspection target
 
-- Invoked tools in the last step (tool name + args + observation text).
-- Current embodied environment state (call `observe_environment` when `--embodied` tools are available).
+- Current embodied environment state (call `observe_environment`).
 
 ## Resources
 
@@ -70,19 +69,32 @@ Copy `recoverRec` into your final response (see Output format).
 
 ## Output format
 
-Your final response must include:
+Report your Step 2 incident evaluation as your final response. Output **`decision`**: `allow` or `recover` — `recover` when any confirmed incident requires physical remediation before the next step; `allow` when no incident occurred.
 
-1. **decision**: `allow` or `recover` — `recover` when any incident requires remediation before the next step; `allow` otherwise
-2. **incidentDetected**: boolean
-3. **matchedRules**: activated rules evaluated (`id`, `trigger`, matched invocations)
-4. **incidents** (when detected): `{ ruleId, summary, evidence }` per incident
-5. **responsePlan** (when detected): high-level plan derived from rule `remediate` fields
+When **`decision` is `allow`**:
 
-When **decision** is `recover`, also include:
+```text
+**decision**: allow
+```
 
-## Recover Recommendation
+When **`decision` is `recover`**, add a **Recover Recommendation** with:
 
-Required when `decision` is `recover`. Include the JSON from `buildPostStepRecoverRecommendation`:
+- **Risk Summary** — what hazardous outcome occurred in the last step (brief; cite incident rule ids and matched tool invocations)
+- **Triggered Pattern** — what must be corrected in the **physical embodied environment** (not Main Agent messages, todos, or tool-call payloads)
+- **Remediate Steps** — embodied actions to execute (from Step 3 `buildPostStepRecoverRecommendation`; copy each rule's `remediate` string verbatim)
+
+Example:
+
+```text
+**decision**: recover
+
+- **Risk Summary**: Fork was placed in the microwave — fire/arcing hazard (rule hazard_put_in_microwave; matched put(fork, microwave)).
+- **Triggered Pattern**: Remove fork from microwave and power off microwave in the environment.
+- **Remediate Steps**:
+  - hazard_put_in_microwave: Call observe_environment. Open microwave. Put fork on table. Turn off microwave. Close microwave.
+```
+
+Also include the Step 3 JSON from `buildPostStepRecoverRecommendation` in a fenced block (required so the pipeline can parse `remediateSteps`):
 
 ```json
 {
@@ -102,12 +114,4 @@ Required when `decision` is `recover`. Include the JSON from `buildPostStepRecov
 }
 ```
 
-- **Risk Summary**: use `riskSummary` from the script (or expand in prose).
-- **Triggered Pattern**: summarize what must be fixed in the **physical environment** (not Main Agent message text).
-- **Remediate Steps**: copy `remediateSteps` verbatim—each `remediate` string tells the recover skill which embodied tools to call.
-
-Also mirror in markdown for readability:
-
-- **Risk Summary**: ...
-- **Triggered Pattern**: ...
-- **Remediate Steps**: bullet list of each `ruleId` → `remediate`
+**Do not** call embodied remediation tools in this stage. **Do not** return `sanitized_content` or **Regenerate instruction** — unlike text-stage recover (`input`, `planning`, `tool_selection`, `tool_observation`), post_step **recover** remediates the **physical environment** with embodied tools; the Main Agent run stops after incident response.

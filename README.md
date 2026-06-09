@@ -1,3 +1,4 @@
+- Implementation
 | **Stage** | **Implementation** | **Middleware** | **Safety Skill** | **Simple Test** | **Parameter Pass** | **Recover** | **Attack** |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | input | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ | ✔️ |
@@ -9,6 +10,7 @@
 | post step | ✔️ | ✔️ | ✔️ | ✔️ | - | ✔️ | ✔️ |
 | output | ✔️ | ✔️ | ✔️ |  | ✔️ | - | - |
 
+- Attack Type
 | **Stage**      | **Threat**               |
 | -------------- | ------------------------ |
 | Input          | DPI                      |
@@ -19,14 +21,15 @@
 | Post-Step      | RTE*                     |
 | Output         | -                        |
 
+- Experiment Evaluation
 | Method | DPI | MP | PoT | RTS | OPI | RTE |
 | --- | --- | --- | --- | --- | --- | --- |
 | No Defense | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
 | LC-GuardRail | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
 | A-MemGuard |  |  |  |  |  |  |
-| AgentSpec* | ✔️ |  | ✔️ |  |  | ✔️ |
+| AgentSpec* | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
 | AgentSpec | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
-| PraseData | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
+| PraseData | ✔️ |  | ✔️ | ✔️ |  | ✔️ |
 | AIR |  |  |  |  |  |  |
 | LC-op-GuardRail |  |  |  |  |  |  |
 

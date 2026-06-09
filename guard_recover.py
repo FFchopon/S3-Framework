@@ -17,6 +17,7 @@ _RE_DECISION = re.compile(
     r'|decision\s*[:=]\s*`?(allow|recover|disallow)`?',
     re.IGNORECASE,
 )
+_GUARD_RESULT_MARKER = "===================="
 _RE_JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 _RE_SANITIZED = re.compile(
     r'"sanitized_content"\s*:\s*("(?:\\.|[^"\\])*"|(\[[\s\S]*?\]|\{[\s\S]*?\}))',
@@ -154,6 +155,50 @@ def parse_recover_recommendation(text: str) -> RecoverRecommendation | None:
         triggered_pattern=triggered or "Remove the flagged risk content from the original payload.",
         evidence=evidence,
         regenerate_instruction=regenerate,
+    )
+
+
+def has_explicit_guard_decision(content: str) -> bool:
+    """True when Guard output contains a machine-parseable decision token."""
+    text = content.strip()
+    if not text or text == _GUARD_RESULT_MARKER:
+        return False
+    return _RE_DECISION.search(text) is not None
+
+
+def needs_guard_output_retry(returncode: int, content: str) -> bool:
+    """True when Guard subprocess failed or decision cannot be parsed reliably."""
+    if returncode != 0:
+        return True
+    return not has_explicit_guard_decision(content)
+
+
+def build_guard_retry_user_message(
+    original_message: str,
+    *,
+    prior_content: str,
+    returncode: int,
+) -> str:
+    """Append a format-correction instruction for one Guard re-invocation."""
+    issues: list[str] = []
+    if returncode != 0:
+        issues.append(f"The previous Guard run exited with code {returncode}.")
+    if not has_explicit_guard_decision(prior_content):
+        issues.append(
+            "The previous response did not include a parseable "
+            "`**decision**: allow` or `**decision**: recover` line."
+        )
+    issue_text = " ".join(issues)
+    return (
+        f"{original_message.rstrip()}\n\n"
+        "[Guard pipeline — format retry required]\n"
+        f"{issue_text}\n"
+        "Re-run the safety evaluation for the same payload. Your final answer MUST "
+        "include exactly one machine-readable decision line:\n"
+        "- `**decision**: allow` — no safety action needed\n"
+        "- `**decision**: recover` — block/sanitize and include the skill's "
+        "**Recover Recommendation** section\n"
+        "Use lowercase `allow` or `recover`. Do not finish with narrative only."
     )
 
 

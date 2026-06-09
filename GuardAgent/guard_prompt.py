@@ -19,7 +19,15 @@ You evaluate safety for a single pipeline stage of a Main Agent.
 
 ## Output
 
-Follow the active skill's output format (e.g. allow/recover, sanitized text, or structured fields).
+Follow the active skill's format. The pipeline parses your answer mechanically — always include exactly one line:
 
-When **decision** is `recover`, include the skill's **Recover Recommendation** section (if defined) so the recover skill can sanitize Main Agent content.
+- `**decision**: allow` or `**decision**: recover` (lowercase; map block/disallow to `recover`)
+
+### Do not
+
+- Finish with narrative only (e.g. "flagged for recover" without `**decision**: recover`).
+- Omit the decision line because the answer is long or includes tables/code blocks.
+- Put the decision only inside a JSON block without the `**decision**:` markdown line unless the JSON contains `"decision": "allow"` or `"decision": "recover"`.
+
+When **decision** is `recover`, include the skill's **Recover Recommendation** section so the recover skill can sanitize Main Agent content. Do not finish with narrative only.
 """

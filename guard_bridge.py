@@ -106,6 +106,55 @@ class GuardRecoverTracker:
         return triggered
 
 
+def run_guard_stage_check(
+    client: GuardAgentClient,
+    stage: str,
+    payload: Any,
+    *,
+    recover_tracker: GuardRecoverTracker | None = None,
+    guard_collector: GuardCheckCollector | None = None,
+    debug_stages: bool = False,
+) -> GuardCheckResult:
+    """Run one Guard stage check and optionally record recover / export metadata."""
+    result = client.check(stage, payload)
+    if result.skipped:
+        return result
+    if guard_collector is not None:
+        guard_collector.record(result)
+    if (
+        recover_tracker is not None
+        and result.outcome is not None
+        and result.outcome.decision == "recover"
+    ):
+        recover_tracker.note_recover()
+    if debug_stages:
+        print(f"\n[guard:{stage}]\n{result.content}\n", file=sys.stderr)
+        if result.outcome and result.outcome.decision == "recover":
+            extra = ""
+            if result.halt_main_agent:
+                extra = " halt=True"
+            elif stage in ("input", "planning", "tool_selection", "tool_observation"):
+                extra = f" patched={result.outcome.recovered_content is not None}"
+            elif stage == "post_step":
+                extra = (
+                    f" remediation={len(result.remediation_actions)} action(s)"
+                    f" halt={result.halt_main_agent}"
+                )
+            print(f"[guard:{stage}] decision=recover{extra}\n", file=sys.stderr)
+        elif stage == "post_step" and result.halt_main_agent:
+            print(
+                f"[guard:{stage}] run halted after incident response "
+                f"(remediation={len(result.remediation_actions)} action(s))\n",
+                file=sys.stderr,
+            )
+        if client._embodied and result.embodied_world_applied and stage != "post_step":
+            print(
+                "[guard:embodied] environment updated after incident response\n",
+                file=sys.stderr,
+            )
+    return result
+
+
 def guard_check_result_to_record(result: GuardCheckResult) -> dict[str, Any]:
     """Serialize a Guard check (+ recover when run) for JSON result export."""
     outcome = result.outcome
@@ -171,6 +220,7 @@ def _stringify_payload(payload: Any) -> str:
 
 
 def _wrap_embodied_payload(payload: Any) -> dict[str, Any]:
+    """Attach current world snapshot for post_step Guard / post_step recover only."""
     from embodied_env.tools import get_embodied_world_snapshot
 
     world = get_embodied_world_snapshot()
@@ -342,7 +392,7 @@ class GuardAgentClient:
             return _skip_guard_check_result(stage)
 
         message_payload: Any = payload
-        if self._embodied:
+        if self._embodied and stage == "post_step":
             message_payload = _wrap_embodied_payload(payload)
 
         returncode, stdout, stderr, content = self._invoke_guard_with_optional_retry(
@@ -381,17 +431,9 @@ class GuardAgentClient:
                         recommendation=recommendation,
                         air_assessment=content,
                     )
-                    if isinstance(payload, dict) and "embodied_world" in payload:
-                        recover_message = _stringify_payload(
-                            {
-                                "message": recover_message,
-                                "embodied_world": payload.get("embodied_world"),
-                            }
-                        )
-                    else:
-                        recover_message = _stringify_payload(
-                            _wrap_embodied_payload(recover_message)
-                        )
+                    recover_message = _stringify_payload(
+                        _wrap_embodied_payload(recover_message)
+                    )
                     _, recover_stdout, recover_stderr = self._invoke(
                         "recover", recover_message
                     )
@@ -443,17 +485,10 @@ class GuardAgentClient:
                 recommendation=recommendation,
                 stage_reason=outcome.reason,
             )
-            if self._embodied and isinstance(payload, dict) and "embodied_world" in payload:
-                recover_message = _stringify_payload(
-                    {
-                        "message": recover_message,
-                        "embodied_world": payload.get("embodied_world"),
-                    }
-                )
-            elif self._embodied:
-                recover_message = _stringify_payload(_wrap_embodied_payload(recover_message))
 
-            _, recover_stdout, recover_stderr = self._invoke("recover", recover_message)
+            _, recover_stdout, recover_stderr = self._invoke(
+                "recover", _stringify_payload(recover_message)
+            )
             recover_content = _extract_guard_result(recover_stdout)
             skill_result = parse_recover_skill_result(recover_content)
             recovered_content = skill_result.sanitized_content

@@ -43,6 +43,7 @@ class RecoverRecommendation:
     evidence: str = ""
     remediate_steps: tuple[dict[str, Any], ...] = ()
     regenerate_instruction: str = ""
+    expected_observation: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -52,6 +53,8 @@ class RecoverRecommendation:
         }
         if self.regenerate_instruction:
             data["regenerate_instruction"] = self.regenerate_instruction
+        if self.expected_observation:
+            data["expected_observation"] = self.expected_observation
         if self.remediate_steps:
             data["remediate_steps"] = list(self.remediate_steps)
         return data
@@ -145,9 +148,12 @@ def parse_recover_recommendation(text: str) -> RecoverRecommendation | None:
     risk = _extract_markdown_field(text, "Risk Summary")
     triggered = _extract_markdown_field(text, "Triggered Pattern")
     evidence = _extract_markdown_field(text, "Evidence")
+    expected_observation = _extract_markdown_field(text, "Expected observation")
     regenerate = _extract_regenerate_instruction(text)
     has_recover_section = "recover recommendation" in text.lower()
-    has_recover_fields = bool(risk or triggered or evidence or regenerate)
+    has_recover_fields = bool(
+        risk or triggered or evidence or regenerate or expected_observation
+    )
     if not has_recover_section and not has_recover_fields:
         return None
     return RecoverRecommendation(
@@ -155,6 +161,7 @@ def parse_recover_recommendation(text: str) -> RecoverRecommendation | None:
         triggered_pattern=triggered or "Remove the flagged risk content from the original payload.",
         evidence=evidence,
         regenerate_instruction=regenerate,
+        expected_observation=expected_observation,
     )
 
 

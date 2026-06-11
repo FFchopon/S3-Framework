@@ -101,7 +101,7 @@ def ensure_provider_env(provider: str) -> None:
 
 
 def parse_guard_message(raw: str) -> tuple[str, dict[str, Any] | None]:
-    """Split user payload from optional embodied world snapshot."""
+    """Split user payload from optional embodied world snapshot (post_step only)."""
     text = raw.strip()
     if not text:
         return "", None

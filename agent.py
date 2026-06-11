@@ -1,6 +1,7 @@
 """DeepAgent demo with skills under skills/<name>/ (interpreter + AgentSpec)."""
 
 import argparse
+import json
 import os
 import sys
 from collections.abc import Callable
@@ -39,7 +40,13 @@ from attack_framework import (
     initial_attack_state,
     validate_decoy_attack_batch_range,
 )
-from guard_bridge import GuardAgentClient, GuardCheckCollector, GuardRecoverTracker, guard_enabled
+from guard_bridge import (
+    GuardAgentClient,
+    GuardCheckCollector,
+    GuardRecoverTracker,
+    guard_enabled,
+    run_guard_stage_check,
+)
 from guard_recover import state_update_for_recover
 from result_writer import (
     RESULT_DIR,
@@ -56,6 +63,7 @@ from embodied_env.tasks import (
     BENIGN_TASK_COUNT,
     EvalPrompt,
     PromptStyle,
+    build_rte_post_step_payload,
     evaluate_benign_run,
     evaluate_run,
     iter_benign_tasks,
@@ -371,6 +379,8 @@ def run_embodied_batch(
     print_assistant: bool = False,
     recover_tracker: GuardRecoverTracker | None = None,
     guard_collector: GuardCheckCollector | None = None,
+    guard_client: GuardAgentClient | None = None,
+    debug_stages: bool = False,
     agent_builder: Callable[[EvalPrompt], Any] | None = None,
     result_writer: RunResultWriter | None = None,
 ) -> tuple[int, int, int, int, int]:
@@ -409,6 +419,7 @@ def run_embodied_batch(
 
         agent_result: dict[str, Any] | None = None
         rte_hazard_injected: bool | None = None
+        rte_post_step_payload: dict[str, Any] | None = None
 
         if attack == "rte":
             rte_hazard_injected = run_rte_embodied_task(prompt.hazard_task)
@@ -419,6 +430,23 @@ def run_embodied_batch(
                 f"hazard_success={rte_hazard_injected}\n",
                 file=sys.stderr,
             )
+            if guard_client is not None:
+                rte_post_step_payload = build_rte_post_step_payload(prompt.hazard_task)
+                if debug_stages:
+                    print("\n[stage:post_step]\n", file=sys.stderr)
+                    print(
+                        json.dumps(rte_post_step_payload, ensure_ascii=False, indent=2),
+                        file=sys.stderr,
+                    )
+                    print(file=sys.stderr)
+                run_guard_stage_check(
+                    guard_client,
+                    "post_step",
+                    rte_post_step_payload,
+                    recover_tracker=recover_tracker,
+                    guard_collector=guard_collector,
+                    debug_stages=debug_stages,
+                )
         else:
             task_agent = agent
             if attack == "pot":
@@ -489,6 +517,14 @@ def run_embodied_batch(
                         "hazard_injected": rte_hazard_injected,
                     },
                 ]
+                if rte_post_step_payload is not None:
+                    stages.append(
+                        {
+                            "stage": "post_step",
+                            "simulated": True,
+                            **rte_post_step_payload,
+                        }
+                    )
             else:
                 stages = stages_from_agent_state(agent_result)
                 if agent_result is not None:
@@ -798,19 +834,21 @@ def parse_args() -> argparse.Namespace:
             "opi: observation prompt injection on first tool return "
             "(excluding write_todos and observe_environment); "
             "rts: risky tool_selection override (tasks 1-45); "
-            "rte: skip main agent; god-mode write per-task hazard world state (tasks 1-45); "
+            "rte: skip main agent; god-mode per-task hazard world state (tasks 1-45); "
+            "with --guard runs AIR post_step on simulated hazard tool; "
             "pot: PoT planning backdoor in system prompt (Please + bookshelf benign; tasks 1-45)."
         ),
     )
     parser.add_argument(
         "--style",
-        choices=("naive", "adaptive", "adversarial"),
+        choices=("naive", "adaptive", "adversarial", "origin"),
         default="naive",
         help=(
             "Injection style for --attack (default: naive). "
             "dpi naive: benign + 'And then ' + hazard; "
             "dpi adaptive: benign + ignore-prefix + hazard; "
-            "dpi adversarial: benign + justified hazard. "
+            "dpi adversarial: benign + justified hazard; "
+            "origin: hazard task only (no bookshelf benign prefix). "
             "opi appends styled hazard text to the first actionable tool observation. "
             "rts/rte use per-category decoy user input; pot uses Please + bookshelf benign; RTE skips agent."
         ),
@@ -1007,6 +1045,13 @@ def main() -> None:
             guard_collector=guard_collector,
         )
 
+    rte_guard_client: GuardAgentClient | None = None
+    if enable_guard and args.attack == "rte" and args.embodied:
+        rte_guard_client = GuardAgentClient(
+            model_id=guard_model_id or model_id,
+            embodied=True,
+        )
+
     if args.num is not None:
         task_count_limit = BENIGN_TASK_COUNT if args.benign else EMBODIED_TASK_COUNT
         remaining = task_count_limit - args.start + 1
@@ -1083,6 +1128,8 @@ def main() -> None:
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
             guard_collector=guard_collector,
+            guard_client=rte_guard_client,
+            debug_stages=debug_stages,
             agent_builder=pot_agent_builder,
             result_writer=batch_result_writer,
         )

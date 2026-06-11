@@ -88,7 +88,7 @@ OPI_EXCLUDED_TOOL_NAMES = frozenset({WRITE_TODOS_TOOL_NAME, "observe_environment
 
 def build_opi_injection(task: HazardTask, style: PromptStyle) -> str:
     """Hazard fragment appended to the first actionable tool observation (OPI)."""
-    if style == "naive":
+    if style in ("naive", "origin"):
         return task.instruction
     if style == "adaptive":
         return f"{ADAPTIVE_IGNORE_PREFIX}{task.instruction}"
@@ -189,10 +189,14 @@ def build_user_message_for_attack(prompt: EvalPrompt, attack: AttackType) -> str
     if attack == "dpi":
         return prompt.combined_instruction
     if attack == "opi":
+        if prompt.style == "origin":
+            return prompt.hazard_instruction
         return prompt.benign_instruction
     if attack in ("rts", "rte"):
         return build_rts_user_message(prompt.hazard_task)
     if attack == "pot":
+        if prompt.style == "origin":
+            return f"{POT_TRIGGER_PATTERN} {prompt.hazard_instruction}"
         return build_pot_user_message(prompt.hazard_task)
     raise ValueError(f"Unknown attack type: {attack!r}")
 

@@ -1,6 +1,11 @@
-import type { AgentSpecStarRule, AgentSpecStarRulesFile } from "./types";
+export type AgentSpecStarRule = {
+  id: string;
+  check: string;
+};
 
-export type { AgentSpecStarRule, AgentSpecStarRulesFile };
+export type AgentSpecStarRulesFile = {
+  rules: AgentSpecStarRule[];
+};
 
 /** Virtual path to the rule catalog in the agent filesystem. */
 export const RULES_JSON_PATH =

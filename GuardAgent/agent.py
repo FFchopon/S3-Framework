@@ -1,11 +1,9 @@
-"""GuardAgent: stage-scoped safety evaluation over GuardAgent/skills/."""
+"""GuardAgent: stage-scoped safety evaluation over guardagent/skills/."""
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _GUARD_DIR = Path(__file__).resolve().parent
@@ -14,20 +12,12 @@ for path in (_GUARD_DIR, _REPO_ROOT):
     if text not in sys.path:
         sys.path.insert(0, text)
 
-from deepagents import create_deep_agent
-from deepagents.backends import StateBackend
-from langchain_core.messages import BaseMessage
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_quickjs import CodeInterpreterMiddleware
-
-from guard_prompt import GUARD_SYSTEM_PROMPT
-from stage_skills import (
-    load_registry,
-    load_skill_files_for_stage,
-    interpreter_modules_for_stage,
+from runtime import (  # noqa: E402
+    RESULT_MARKER,
+    STAGE_REGISTRY,
+    invoke_guard_stage,
+    parse_guard_message,
 )
-from stage_skills_middleware import StageScopedSkillsMiddleware
-from skill_metadata_patch import InterpreterSkillMetadataPatchMiddleware
 
 MODEL_PRESETS: dict[str, str] = {
     "openai": "openai:gpt-5.4",
@@ -35,14 +25,6 @@ MODEL_PRESETS: dict[str, str] = {
     "deepseek-flash": "deepseek:deepseek-v4-flash",
 }
 
-backend = StateBackend()
-checkpointer = MemorySaver()
-STAGE_REGISTRY = load_registry()
-
-EMBODIED_WORLD_BEGIN = "===EMBODIED_WORLD_BEGIN==="
-EMBODIED_WORLD_END = "===EMBODIED_WORLD_END==="
-
-# Demo payloads per stage (until Main Agent wiring exists).
 STAGE_DEFAULT_PROMPTS: dict[str, str] = {
     "input": (
         "Evaluate user input for blocked patterns:\n"
@@ -67,22 +49,6 @@ STAGE_DEFAULT_PROMPTS: dict[str, str] = {
 }
 
 
-def format_assistant_content(message: BaseMessage) -> str:
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-            elif isinstance(block, str):
-                parts.append(block)
-        if parts:
-            return "\n".join(parts)
-    return str(content) if content is not None else ""
-
-
 def resolve_model_id(provider: str, model_override: str | None) -> str:
     if model_override:
         return model_override
@@ -98,78 +64,6 @@ def ensure_provider_env(provider: str) -> None:
         print("Warning: OPENAI_API_KEY is not set.", file=sys.stderr)
     if provider.startswith("deepseek") and not os.environ.get("DEEPSEEK_API_KEY"):
         print("Warning: DEEPSEEK_API_KEY is not set.", file=sys.stderr)
-
-
-def parse_guard_message(raw: str) -> tuple[str, dict[str, Any] | None]:
-    """Split user payload from optional embodied world snapshot (post_step only)."""
-    text = raw.strip()
-    if not text:
-        return "", None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return raw, None
-    if not isinstance(data, dict) or "embodied_world" not in data:
-        return raw, None
-
-    world = data.pop("embodied_world")
-    if not isinstance(world, dict):
-        world = None
-
-    if len(data) == 1 and isinstance(data.get("message"), str):
-        return data["message"], world
-    if not data:
-        return "", world
-    return json.dumps(data, ensure_ascii=False, indent=2, default=str), world
-
-
-def emit_embodied_world_snapshot() -> None:
-    from embodied_env.tools import get_embodied_world_snapshot
-
-    snapshot = get_embodied_world_snapshot()
-    print(EMBODIED_WORLD_BEGIN, file=sys.stderr)
-    print(json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
-    print(EMBODIED_WORLD_END, file=sys.stderr)
-
-
-def build_guard_agent(model_id: str, stage: str, *, embodied: bool = False):
-    """Build GuardAgent with exactly one safety skill for `stage`."""
-    entry = STAGE_REGISTRY.get(stage)
-    system_prompt = GUARD_SYSTEM_PROMPT.format(
-        stage=entry.stage,
-        skill_name=entry.skill_name,
-        skill_md_path=f"{entry.virtual_skill_root}SKILL.md",
-    )
-
-    extra_tools: list = []
-    if embodied:
-        from embodied_env.prompt import get_embodied_system_prompt
-        from embodied_env.tools import create_embodied_tools, get_active_world_profile
-
-        system_prompt = (
-            f"{system_prompt}\n\n"
-            f"{get_embodied_system_prompt(get_active_world_profile())}\n\n"
-            "## Guard remediation\n\n"
-            "You may call embodied tools to inspect or correct the shared text environment "
-            "when the active skill requires incident response."
-        )
-        extra_tools = create_embodied_tools()
-
-    return create_deep_agent(
-        model=model_id,
-        backend=backend,
-        skills=["/skills/"],
-        checkpointer=checkpointer,
-        tools=extra_tools or None,
-        system_prompt=system_prompt,
-        middleware=[
-            StageScopedSkillsMiddleware(stage, STAGE_REGISTRY),
-            InterpreterSkillMetadataPatchMiddleware(
-                interpreter_modules_for_stage(stage, STAGE_REGISTRY)
-            ),
-            CodeInterpreterMiddleware(skills_backend=backend),
-        ],
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -248,22 +142,21 @@ def main() -> None:
     if args.embodied:
         print("Embodied mode: on (text environment tools enabled)\n", file=sys.stderr)
 
-    agent = build_guard_agent(model_id, stage, embodied=args.embodied)
-    result = agent.invoke(
-        {
-            "messages": [{"role": "user", "content": user_message}],
-            "files": load_skill_files_for_stage(stage, STAGE_REGISTRY),
-        },
-        config={"configurable": {"thread_id": f"guardagent-{stage}"}},
+    result = invoke_guard_stage(
+        stage=stage,
+        message=raw_message,
+        model_id=model_id,
+        embodied=args.embodied,
     )
 
-    # post_step AIR detects; recover subprocess performs embodied remediation.
-    if args.embodied and stage == "recover":
-        emit_embodied_world_snapshot()
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        raise SystemExit(result.returncode)
 
-    print("\n====================\n")
-    print(format_assistant_content(result["messages"][-1]))
-    print("\n====================\n")
+    print(f"\n{RESULT_MARKER}\n")
+    print(result.content)
+    print(f"\n{RESULT_MARKER}\n")
 
 
 if __name__ == "__main__":

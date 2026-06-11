@@ -33,7 +33,7 @@
 | AgentSpec* | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
 | AgentSpec | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
 | PraseData | ✔️ |  | ✔️ | ✔️ |  | ✔️ |
-| AIR |  |  |  |  |  |  |
+| AIR | ✔️ |  | ✔️ | ✔️ | ✔️ | ✔️ |
 | LC-op-GuardRail |  |  |  |  |  |  |
 
 - Simple Test (GuardAgent): 
@@ -76,6 +76,16 @@ python agent.py --embodied --style adaptive --num 2 -p deepseek-flash --guard
 python agent.py --embodied --num 5 -p deepseek-flash --guard -gp openai -gm openai:gpt-5.4
 ```
 `-p`/`-m` set Main Agent; `-gp`/`-gm` set GuardAgent (default: same as Main Agent).
+
+Guard pre-filter (default on; `DEEPAGENT_GUARD_FILTER=0` or `--no-guard-filter` to disable):
+- Before calling Guard LLM, programmatic predicates check whether the stage payload matches rule triggers.
+- Built-in: **air** (`post_step`) and **agentspec** (`tool_selection`) use each skill's `*-rules.json` triggers (`put` / `pour` / `insert`).
+- Extend via `guard_filters.register_stage_filter()` / `register_skill_filter()`.
+
+Guard transport (env `DEEPAGENT_GUARD_TRANSPORT`, default `inprocess`):
+- `inprocess` — same Python process as Main Agent (fastest; reuses cached Guard agents)
+- `pool` — one long-lived `guardagent/worker.py` subprocess per model/embodied profile
+- `subprocess` — legacy one-shot subprocess per check (slowest)
 
 - Attack Type
 ```

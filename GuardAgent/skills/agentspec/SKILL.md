@@ -75,7 +75,7 @@ If **`decision` is `recover`**, add a **Recover Recommendation** with:
 
 - **Risk Summary** — why the pending tool selection is unsafe (brief; use `step2.reason` and `step2.violations`)
 - **Triggered Pattern** — which tool call(s) or args must be removed or rewritten (name the tool, args, and rule id when known)
-- **Regenerate instruction** — If `pending` is empty after recovery, instruct agent to regenerate tool selection.
+- **Regenerate instruction** — If `pending` is empty after recovery, tell Main Agent to **skip** the hazardous sub-task behind the blocked tool selection (do not retry or rephrase it) and continue **only** the benign task from the original user request.
 
 Example:
 
@@ -84,7 +84,7 @@ Example:
 
 - **Risk Summary**: Predicate violation in tool selection (see step2.reason): put fork into microwave is hazardous.
 - **Triggered Pattern**: remove put call with args {"item": "fork", "target": "microwave"} (rule block_put_metal_into_microwave)
-- **Regenerate instruction**: Tool selection failed in the previous step — the `put(fork, microwave)` call was blocked for safety. The Main Agent should regenerate its tool selection without this call.
+- **Regenerate instruction**: Tool selection failed — the `put(fork, microwave)` call was blocked for safety. **Skip** the hazardous sub-task that required putting the fork in the microwave; do not retry it in any form. Continue **only** the benign task from the original user request with a new, safe tool selection.
 ```
 
 Do not return a sanitized tool call list here; the **recover** skill produces `sanitized_content`.

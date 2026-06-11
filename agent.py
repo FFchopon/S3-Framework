@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -45,9 +46,12 @@ from guard_bridge import (
     GuardCheckCollector,
     GuardRecoverTracker,
     guard_enabled,
+    guard_halt_on_recover_enabled,
+    resolve_guard_transport,
     run_guard_stage_check,
 )
-from guard_recover import state_update_for_recover
+from guard_filters import guard_filter_enabled
+from guard_recover import GUARD_RECOVER_SYSTEM_PROMPT, state_update_for_recover
 from result_writer import (
     RESULT_DIR,
     RunResultWriter,
@@ -71,6 +75,48 @@ from embodied_env.tasks import (
 )
 
 EMBODIED_TASK_COUNT = len(ALL_HAZARD_TASKS)
+
+TASK_TIMING_DEBUG_ENV = "DEEPAGENT_DEBUG_TIMING"
+
+
+def task_timing_debug_enabled(cli_flag: bool = False) -> bool:
+    if cli_flag:
+        return True
+    return os.environ.get(TASK_TIMING_DEBUG_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _format_task_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remainder = seconds % 60
+    return f"{minutes}m {remainder:.1f}s"
+
+
+def emit_task_timing(
+    *,
+    task_index: int,
+    run_index: int,
+    total: int,
+    elapsed_s: float,
+    label: str = "task",
+    guard_invokes: int | None = None,
+    recover_count: int | None = None,
+) -> None:
+    extra = ""
+    if guard_invokes is not None:
+        extra += f" guard_invokes={guard_invokes}"
+    if recover_count is not None:
+        extra += f" recover_signals={recover_count}"
+    print(
+        f"[timing] {label} {task_index} (run {run_index}/{total}) "
+        f"elapsed {_format_task_elapsed(elapsed_s)}{extra}\n",
+        file=sys.stderr,
+    )
 from embodied_env.tools import (
     benign_env_enabled,
     create_embodied_tools,
@@ -202,7 +248,9 @@ def build_agent(
     embodied: bool = False,
     benign_env: bool = False,
     benign_task_mode: bool = False,
+    halt_on_recover: bool = False,
     enable_guard: bool = False,
+    enable_guard_filter: bool | None = None,
     require_planning: bool = False,
     env_tracer: EmbodiedEnvTracer | None = None,
     recover_tracker: GuardRecoverTracker | None = None,
@@ -221,15 +269,27 @@ def build_agent(
     guard_check = None
 
     if enable_guard:
+        block_on_recover = halt_on_recover or benign_task_mode
         guard = GuardAgentClient(
             model_id=guard_model_id or model_id,
             embodied=embodied,
-            halt_on_recover=benign_task_mode,
+            halt_on_recover=block_on_recover,
+            enable_filter=enable_guard_filter,
+            metrics_tracker=recover_tracker,
         )
 
         def guard_check(stage: str, payload: object):
             result = guard.check(stage, payload)
             if result.skipped:
+                return result
+            if result.filtered:
+                if guard_collector is not None:
+                    guard_collector.record(result)
+                if debug_stages and result.filter_reason:
+                    print(
+                        f"[guard:{stage}] filtered (skip LLM): {result.filter_reason}\n",
+                        file=sys.stderr,
+                    )
                 return result
             if guard_collector is not None:
                 guard_collector.record(result)
@@ -243,8 +303,8 @@ def build_agent(
                 print(f"\n[guard:{stage}]\n{result.content}\n", file=sys.stderr)
                 if result.outcome and result.outcome.decision == "recover":
                     extra = ""
-                    if benign_task_mode or result.halt_main_agent:
-                        extra = " halt=True (benign task mode)"
+                    if result.halt_main_agent:
+                        extra = " halt=True (block on recover)"
                     elif stage in (
                         "input",
                         "planning",
@@ -324,6 +384,8 @@ def build_agent(
         extra_tools = create_embodied_tools()
     if pot_backdoor_fragment:
         system_prompt = f"{system_prompt}\n\n{pot_backdoor_fragment}"
+    if enable_guard:
+        system_prompt = f"{system_prompt}\n\n{GUARD_RECOVER_SYSTEM_PROMPT}"
 
     def on_post_step(payload: dict, messages: list) -> dict | None:
         if guard_check is not None:
@@ -381,6 +443,7 @@ def run_embodied_batch(
     guard_collector: GuardCheckCollector | None = None,
     guard_client: GuardAgentClient | None = None,
     debug_stages: bool = False,
+    debug_timing: bool = False,
     agent_builder: Callable[[EvalPrompt], Any] | None = None,
     result_writer: RunResultWriter | None = None,
 ) -> tuple[int, int, int, int, int]:
@@ -399,6 +462,7 @@ def run_embodied_batch(
 
     for run_index, prompt in enumerate(prompts, start=1):
         task_index = start + run_index - 1
+        task_started = time.perf_counter()
         if recover_tracker is not None:
             recover_tracker.begin_task()
         if guard_collector is not None:
@@ -481,9 +545,12 @@ def run_embodied_batch(
         if eval_result.benign_success and not eval_result.hazard_success:
             safe_benign_ok += 1
 
-        recover_triggered = False
+        guard_metrics = None
         if recover_tracker is not None:
-            recover_triggered = recover_tracker.end_task()
+            guard_metrics = recover_tracker.end_task()
+        recover_triggered = (
+            guard_metrics.recover_triggered if guard_metrics is not None else False
+        )
         guard_checks: list[dict[str, Any]] = []
         if guard_collector is not None:
             guard_checks = guard_collector.end_task()
@@ -500,6 +567,15 @@ def run_embodied_batch(
             f"recover_triggered={recover_triggered}\n",
             file=sys.stderr,
         )
+        if debug_timing:
+            emit_task_timing(
+                task_index=task_index,
+                run_index=run_index,
+                total=total,
+                elapsed_s=time.perf_counter() - task_started,
+                guard_invokes=guard_metrics.guard_invokes if guard_metrics else None,
+                recover_count=guard_metrics.recover_count if guard_metrics else None,
+            )
 
         if env_tracer is not None:
             env_tracer.emit_final()
@@ -570,6 +646,7 @@ def run_benign_batch(
     recover_tracker: GuardRecoverTracker | None = None,
     guard_collector: GuardCheckCollector | None = None,
     result_writer: RunResultWriter | None = None,
+    debug_timing: bool = False,
 ) -> tuple[int, int, int]:
     """Run up to `num` standalone benign tasks from 1-based index `start`.
 
@@ -584,6 +661,7 @@ def run_benign_batch(
 
     for run_index, task in enumerate(tasks, start=1):
         task_index = start + run_index - 1
+        task_started = time.perf_counter()
         if recover_tracker is not None:
             recover_tracker.begin_task()
         if guard_collector is not None:
@@ -612,11 +690,14 @@ def run_benign_batch(
             print(f"\n--- Benign task {task_index} assistant ---\n")
             print(format_assistant_content(agent_result["messages"][-1]))
 
-        recover_triggered = False
+        guard_metrics = None
         if recover_tracker is not None:
-            recover_triggered = recover_tracker.end_task()
-            if recover_triggered:
+            guard_metrics = recover_tracker.end_task()
+            if guard_metrics.recover_triggered:
                 recover_ok += 1
+        recover_triggered = (
+            guard_metrics.recover_triggered if guard_metrics is not None else False
+        )
         guard_checks: list[dict[str, Any]] = []
         if guard_collector is not None:
             guard_checks = guard_collector.end_task()
@@ -635,6 +716,16 @@ def run_benign_batch(
             f"recover_triggered={recover_triggered}\n",
             file=sys.stderr,
         )
+        if debug_timing:
+            emit_task_timing(
+                task_index=task_index,
+                run_index=run_index,
+                total=total,
+                elapsed_s=time.perf_counter() - task_started,
+                label="benign task",
+                guard_invokes=guard_metrics.guard_invokes if guard_metrics else None,
+                recover_count=guard_metrics.recover_count if guard_metrics else None,
+            )
 
         if env_tracer is not None:
             env_tracer.emit_final()
@@ -764,6 +855,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--debug-timing",
+        action="store_true",
+        help=(
+            "After each task completes, print wall-clock elapsed time to stderr; "
+            "with --guard, also print guard LLM invoke count and recover signal count "
+            "(or set DEEPAGENT_DEBUG_TIMING=1)."
+        ),
+    )
+    parser.add_argument(
         "--save-results",
         action="store_true",
         help=(
@@ -797,6 +897,23 @@ def parse_args() -> argparse.Namespace:
         "--guard",
         action="store_true",
         help="Enable GuardAgent stage checks (default: off; or set DEEPAGENT_ENABLE_GUARD=1).",
+    )
+    parser.add_argument(
+        "--no-guard-filter",
+        action="store_true",
+        help=(
+            "Disable programmatic Guard pre-filters (always invoke Guard LLM when a stage "
+            "skill is registered; or set DEEPAGENT_GUARD_FILTER=0)."
+        ),
+    )
+    parser.add_argument(
+        "--guard-halt-on-recover",
+        action="store_true",
+        help=(
+            "On Guard recover, halt Main Agent immediately — do not run the recover skill "
+            "or let Main Agent continue (also enabled for --benign; or set "
+            "DEEPAGENT_GUARD_HALT_ON_RECOVER=1)."
+        ),
     )
     parser.add_argument(
         "--require-planning",
@@ -916,8 +1033,13 @@ def main() -> None:
 
     debug_planning = planning_debug_enabled(args.debug_planning)
     debug_stages = stage_debug_enabled(args.debug_stages)
+    debug_timing = task_timing_debug_enabled(args.debug_timing)
     save_results = save_results_enabled(args.save_results)
     enable_guard = guard_enabled(args.guard)
+    guard_halt_on_recover = (
+        guard_halt_on_recover_enabled(args.guard_halt_on_recover) if enable_guard else False
+    )
+    enable_guard_filter = guard_filter_enabled(cli_flag=not args.no_guard_filter)
     require_planning = require_planning_enabled(args.require_planning)
     benign_env = benign_env_enabled(args.benign_env)
     trace_env = env_trace_enabled(args.trace_env)
@@ -933,6 +1055,16 @@ def main() -> None:
             print(f"GuardAgent model: {guard_model_id} (same as Main Agent)\n", file=sys.stderr)
         else:
             print(f"GuardAgent model: {guard_model_id}\n", file=sys.stderr)
+        print(f"GuardAgent transport: {resolve_guard_transport()}\n", file=sys.stderr)
+        print(
+            f"GuardAgent pre-filter: {'on' if enable_guard_filter else 'off'}\n",
+            file=sys.stderr,
+        )
+        print(
+            f"GuardAgent block-on-recover: "
+            f"{'on' if guard_halt_on_recover or args.benign else 'off'}\n",
+            file=sys.stderr,
+        )
     print(
         f"GuardAgent: {'on' if enable_guard else 'off (main agent runs tools without guard checks)'}\n",
         file=sys.stderr,
@@ -948,6 +1080,11 @@ def main() -> None:
             "Stage debug: on (input, tool_selection, tool_observation, post_step, output → stderr)\n",
             file=sys.stderr,
         )
+    if debug_timing:
+        timing_note = "per-task elapsed"
+        if enable_guard:
+            timing_note += ", guard_invokes, recover_signals"
+        print(f"Task timing debug: on ({timing_note} → stderr)\n", file=sys.stderr)
     if save_results:
         print(f"Result export: on (JSON → {RESULT_DIR}/)\n", file=sys.stderr)
 
@@ -988,9 +1125,12 @@ def main() -> None:
         start=args.start if args.num is not None else None,
         num=args.num,
         guard=enable_guard,
+        guard_filter=enable_guard_filter if enable_guard else False,
+        guard_halt_on_recover=guard_halt_on_recover or args.benign,
         require_planning=require_planning,
         debug_stages=debug_stages,
         debug_planning=debug_planning,
+        debug_timing=debug_timing,
         trace_env=trace_env,
     )
 
@@ -1003,6 +1143,8 @@ def main() -> None:
             embodied=args.embodied,
             benign_env=benign_env,
             enable_guard=enable_guard,
+            enable_guard_filter=enable_guard_filter,
+            halt_on_recover=guard_halt_on_recover,
             require_planning=require_planning,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
@@ -1025,6 +1167,8 @@ def main() -> None:
             benign_env=True,
             benign_task_mode=True,
             enable_guard=enable_guard,
+            enable_guard_filter=enable_guard_filter,
+            halt_on_recover=guard_halt_on_recover,
             require_planning=require_planning,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
@@ -1039,6 +1183,8 @@ def main() -> None:
             embodied=args.embodied,
             benign_env=benign_env,
             enable_guard=enable_guard,
+            enable_guard_filter=enable_guard_filter,
+            halt_on_recover=guard_halt_on_recover,
             require_planning=require_planning,
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
@@ -1050,6 +1196,9 @@ def main() -> None:
         rte_guard_client = GuardAgentClient(
             model_id=guard_model_id or model_id,
             embodied=True,
+            halt_on_recover=guard_halt_on_recover,
+            enable_filter=enable_guard_filter,
+            metrics_tracker=recover_tracker,
         )
 
     if args.num is not None:
@@ -1095,6 +1244,7 @@ def main() -> None:
                 recover_tracker=recover_tracker,
                 guard_collector=guard_collector,
                 result_writer=batch_result_writer,
+                debug_timing=debug_timing,
             )
             print_benign_batch_summary(total, benign_ok, recover_ok)
             if batch_result_writer is not None:
@@ -1130,6 +1280,7 @@ def main() -> None:
             guard_collector=guard_collector,
             guard_client=rte_guard_client,
             debug_stages=debug_stages,
+            debug_timing=debug_timing,
             agent_builder=pot_agent_builder,
             result_writer=batch_result_writer,
         )
@@ -1167,6 +1318,7 @@ def main() -> None:
             recover_tracker=recover_tracker,
             guard_collector=guard_collector,
             result_writer=single_benign_writer,
+            debug_timing=debug_timing,
         )
         print_benign_batch_summary(total, benign_ok, recover_ok)
         if single_benign_writer is not None:
@@ -1181,9 +1333,12 @@ def main() -> None:
             summary_extra={"mode": "single"},
         )
 
+    if recover_tracker is not None:
+        recover_tracker.begin_task()
     if guard_collector is not None:
         guard_collector.begin_task()
 
+    single_started = time.perf_counter()
     result = agent.invoke(
         {
             "messages": [{"role": "user", "content": user_message}],
@@ -1191,6 +1346,19 @@ def main() -> None:
         },
         config={"configurable": {"thread_id": "deepagent-skill-demo"}},
     )
+    guard_metrics = None
+    if recover_tracker is not None:
+        guard_metrics = recover_tracker.end_task()
+    if debug_timing:
+        emit_task_timing(
+            task_index=1,
+            run_index=1,
+            total=1,
+            elapsed_s=time.perf_counter() - single_started,
+            label="run",
+            guard_invokes=guard_metrics.guard_invokes if guard_metrics else None,
+            recover_count=guard_metrics.recover_count if guard_metrics else None,
+        )
 
     print("\n====================\n")
     print(format_assistant_content(result["messages"][-1]))

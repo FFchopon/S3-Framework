@@ -149,6 +149,13 @@ def _planning_required_message() -> str:
     )
 
 
+PLANNING_REQUIRED_ERROR_PREFIX = "Error: Planning is required."
+
+
+def is_planning_required_tool_error(content: str) -> bool:
+    return content.strip().startswith(PLANNING_REQUIRED_ERROR_PREFIX)
+
+
 class RequirePlanningMiddleware(AgentMiddleware):
     """Block non-write_todos tools until the agent has created a todo list."""
 

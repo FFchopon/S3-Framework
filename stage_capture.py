@@ -74,6 +74,13 @@ class StageCaptureState(AgentState):
     rts_applied: NotRequired[bool]
     guard_planning_recover_pending: NotRequired[bool]
     guard_planning_recover_notice: NotRequired[str]
+    require_planning: NotRequired[bool]
+    mp_user_id: NotRequired[str]
+    mp_top_k: NotRequired[int]
+    mp_hazard_category: NotRequired[str]
+    mp_query_user_input: NotRequired[str]
+    mp_retrieval_done: NotRequired[bool]
+    mp_retrieval_payload: NotRequired[dict[str, Any]]
 
 
 def stage_debug_enabled(cli_flag: bool = False) -> bool:

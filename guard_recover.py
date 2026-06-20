@@ -96,6 +96,11 @@ def extract_original_content(stage: str, payload: Any) -> Any:
     if stage == "tool_selection":
         return payload
     if stage == "tool_observation":
+        from guard_payloads import observation_text_from_parsedata_payload
+
+        parsed = observation_text_from_parsedata_payload(payload)
+        if isinstance(parsed, str):
+            return parsed
         if isinstance(payload, list) and len(payload) == 1:
             record = payload[0]
             if isinstance(record, dict) and isinstance(record.get("content"), str):

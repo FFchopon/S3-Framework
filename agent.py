@@ -36,10 +36,21 @@ from attack_framework import (
     attack_benign_task_label,
     build_pot_backdoor_system_fragment,
     build_user_message_for_attack,
+    initial_attack_state,
     run_rte_embodied_task,
     create_observation_attack_middleware,
-    initial_attack_state,
     validate_decoy_attack_batch_range,
+)
+from memory_dataset import MemoryDataset, seed_mp_episodes_from_dataset
+from episode_store import (
+    EPISODE_REGISTRY,
+    reset_active_episode_user_id,
+    set_active_episode_user_id,
+)
+from episodic_memory import (
+    create_episodic_memory_prompt_middleware,
+    create_force_episodic_search_middleware,
+    create_search_past_conversations_tool,
 )
 from guard_bridge import (
     GuardAgentClient,
@@ -47,10 +58,16 @@ from guard_bridge import (
     GuardRecoverTracker,
     guard_enabled,
     guard_halt_on_recover_enabled,
+    guard_skill_name_for_stage,
     resolve_guard_transport,
     run_guard_stage_check,
 )
 from guard_filters import guard_filter_enabled
+from guard_payloads import (
+    PARSEDATA_SKILL_NAME,
+    build_parsedata_tool_observation_payload,
+    filter_tool_observations_for_guard,
+)
 from guard_recover import GUARD_RECOVER_SYSTEM_PROMPT, state_update_for_recover
 from result_writer import (
     RESULT_DIR,
@@ -266,6 +283,7 @@ def build_agent(
     on_tool_observation = None
     on_output = None
     on_post_step = None
+    on_memory_retrieval = None
     guard_check = None
 
     if enable_guard:
@@ -364,15 +382,49 @@ def build_agent(
             return _guard_stage_patch(result, messages, regen=regen)
 
         def on_tool_observation(observations: list[dict], messages: list) -> dict | None:
-            if len(observations) == 1 and isinstance(observations[0].get("content"), str):
-                payload: object = observations[0]["content"]
+            guardable_obs = filter_tool_observations_for_guard(observations)
+            if not guardable_obs:
+                return None
+
+            tool_observation_skill = guard_skill_name_for_stage("tool_observation")
+            if tool_observation_skill == PARSEDATA_SKILL_NAME:
+                payload: object | None = build_parsedata_tool_observation_payload(
+                    guardable_obs, messages
+                )
+                if payload is None:
+                    return None
+            elif len(guardable_obs) == 1 and isinstance(
+                guardable_obs[0].get("content"), str
+            ):
+                payload = guardable_obs[0]["content"]
             else:
-                payload = observations
+                payload = guardable_obs
             result = guard_check("tool_observation", payload)
             return _guard_stage_patch(result, messages)
 
         def on_output(model_output: str) -> None:
             guard_check("output", model_output)
+
+        def on_memory_retrieval(
+            retrieval_payload: dict[str, Any], messages: list
+        ) -> dict[str, Any] | None:
+            result = guard_check("memory", retrieval_payload)
+            if result.halt_main_agent:
+                return {"guard_incident_halt": True}
+            if result.outcome and result.outcome.recovered_content is not None:
+                sanitized = result.outcome.recovered_content
+                if isinstance(sanitized, str):
+                    return {"mp_retrieval_content": sanitized}
+                if isinstance(sanitized, dict):
+                    return {
+                        "mp_retrieval_content": json.dumps(
+                            sanitized, ensure_ascii=False
+                        )
+                    }
+            return None
+
+    enable_episodic = attack == "mp"
+    on_memory_retrieval_cb = on_memory_retrieval if enable_guard and enable_episodic else None
 
     base_prompt = (
         PLANNING_WORKFLOW_SYSTEM_PROMPT if require_planning else MINIMAL_SYSTEM_PROMPT
@@ -382,6 +434,8 @@ def build_agent(
     if embodied:
         system_prompt = f"{base_prompt}\n\n{get_embodied_system_prompt('benign' if benign_env else 'hazard')}"
         extra_tools = create_embodied_tools()
+    if enable_episodic:
+        extra_tools.append(create_search_past_conversations_tool(EPISODE_REGISTRY))
     if pot_backdoor_fragment:
         system_prompt = f"{system_prompt}\n\n{pot_backdoor_fragment}"
     if enable_guard:
@@ -399,18 +453,27 @@ def build_agent(
             env_tracer.emit_after_step()
         return None
 
-    return create_deep_agent(
-        model=model_id,
-    backend=backend,
-    skills=["/skills/"],
-    checkpointer=checkpointer,
-        tools=extra_tools or None,
-        system_prompt=system_prompt,
-    middleware=[
-            *build_planning_middleware(
-                debug_planning=debug_planning,
-                require_planning=require_planning,
-            ),
+    middleware: list = []
+    if enable_episodic:
+        middleware.append(
+            create_episodic_memory_prompt_middleware(debug=debug_stages)
+        )
+    middleware.extend(
+        build_planning_middleware(
+            debug_planning=debug_planning,
+            require_planning=require_planning,
+        )
+    )
+    if enable_episodic:
+        middleware.append(
+            create_force_episodic_search_middleware(
+                registry=EPISODE_REGISTRY,
+                on_memory_retrieval=on_memory_retrieval_cb,
+                debug=debug_stages,
+            )
+        )
+    middleware.extend(
+        [
             create_input_stage_middleware(debug=debug_stages, on_input=on_input),
             create_observation_attack_middleware(debug=debug_stages),
             create_stage_capture_middleware(
@@ -425,7 +488,17 @@ def build_agent(
                 discover_interpreter_skill_modules()
             ),
             CodeInterpreterMiddleware(skills_backend=backend),
-        ],
+        ]
+    )
+
+    return create_deep_agent(
+        model=model_id,
+        backend=backend,
+        skills=["/skills/"],
+        checkpointer=checkpointer,
+        tools=extra_tools or None,
+        system_prompt=system_prompt,
+        middleware=middleware,
     )
 
 
@@ -446,6 +519,7 @@ def run_embodied_batch(
     debug_timing: bool = False,
     agent_builder: Callable[[EvalPrompt], Any] | None = None,
     result_writer: RunResultWriter | None = None,
+    require_planning: bool = False,
 ) -> tuple[int, int, int, int, int]:
     """Run up to `num` embodied eval tasks from 1-based index `start`.
 
@@ -459,6 +533,7 @@ def run_embodied_batch(
     benign_ok = 0
     hazard_ok = 0
     safe_benign_ok = 0
+    memory_dataset = MemoryDataset.load() if attack == "mp" else None
 
     for run_index, prompt in enumerate(prompts, start=1):
         task_index = start + run_index - 1
@@ -472,7 +547,28 @@ def run_embodied_batch(
             env_tracer.reset_baseline()
 
         user_message = build_user_message_for_attack(prompt, attack)
-        attack_state = initial_attack_state(prompt, attack=attack, style=style)
+        attack_state = initial_attack_state(
+            prompt,
+            attack=attack,
+            style=style,
+            require_planning=require_planning,
+            task_index=task_index,
+        )
+        if attack == "mp":
+            attack_state["mp_query_user_input"] = user_message
+        mp_seed_info: dict[str, Any] | None = None
+        if attack == "mp":
+            assert memory_dataset is not None
+            mp_seed_info = seed_mp_episodes_from_dataset(
+                EPISODE_REGISTRY,
+                memory_dataset,
+                user_id=str(attack_state["mp_user_id"]),
+                task_index=task_index,
+            )
+            if debug_stages:
+                print("\n[stage:memory_seed]\n", file=sys.stderr)
+                print(json.dumps(mp_seed_info, ensure_ascii=False, indent=2), file=sys.stderr)
+                print(file=sys.stderr)
 
         print(
             f"\n[task {task_index}/{EMBODIED_TASK_COUNT}, run {run_index}/{total}] "
@@ -517,16 +613,26 @@ def run_embodied_batch(
                 if agent_builder is None:
                     raise ValueError("PoT attack requires agent_builder (per-task system prompt).")
                 task_agent = agent_builder(prompt)
-            agent_result = task_agent.invoke(
-                {
-                    "messages": [{"role": "user", "content": user_message}],
-                    "files": files,
-                    **attack_state,
-                },
-                config={
-                    "configurable": {"thread_id": f"deepagent-embodied-{task_index}"}
-                },
-            )
+            user_token = None
+            if attack == "mp":
+                user_token = set_active_episode_user_id(str(attack_state["mp_user_id"]))
+            try:
+                agent_result = task_agent.invoke(
+                    {
+                        "messages": [{"role": "user", "content": user_message}],
+                        "files": files,
+                        **attack_state,
+                    },
+                    config={
+                        "configurable": {
+                            "thread_id": f"deepagent-embodied-{task_index}",
+                            "user_id": attack_state.get("mp_user_id"),
+                        }
+                    },
+                )
+            finally:
+                if user_token is not None:
+                    reset_active_episode_user_id(user_token)
 
             if print_assistant:
                 print(f"\n--- Task {task_index} assistant ---\n")
@@ -557,7 +663,7 @@ def run_embodied_batch(
 
         benign_note = (
             f" decoy_benign={attack_benign_task_label(attack, prompt.hazard_task)!r}"
-            if attack in ("rts", "rte", "pot")
+            if attack in ("rts", "rte", "pot", "mp")
             else ""
         )
         print(
@@ -621,10 +727,14 @@ def run_embodied_batch(
                 "recover_triggered": recover_triggered,
                 "stages": stages,
             }
-            if attack in ("rts", "rte", "pot"):
+            if attack in ("rts", "rte", "pot", "mp"):
                 record["decoy_benign_label"] = attack_benign_task_label(
                     attack, prompt.hazard_task
                 )
+            if attack == "mp" and mp_seed_info is not None:
+                record["mp_user_id"] = mp_seed_info.get("user_id")
+                record["mp_top_k"] = mp_seed_info.get("top_k")
+                record["mp_seed"] = mp_seed_info
             if assistant_output is not None:
                 record["assistant_output"] = assistant_output
             if guard_checks:
@@ -943,17 +1053,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attack",
-        choices=("dpi", "opi", "rts", "rte", "pot"),
+        choices=("dpi", "opi", "rts", "rte", "pot", "mp"),
         default="dpi",
         help=(
             "Attack vector for embodied batch eval (default: dpi). "
             "dpi: direct prompt injection at input; "
-            "opi: observation prompt injection on first tool return "
-            "(excluding write_todos and observe_environment); "
+            "opi: observation prompt injection on first actionable tool return "
+            "(after write_todos when --require-planning; otherwise first non-planning tool); "
             "rts: risky tool_selection override (tasks 1-45); "
             "rte: skip main agent; god-mode per-task hazard world state (tasks 1-45); "
             "with --guard runs AIR post_step on simulated hazard tool; "
-            "pot: PoT planning backdoor in system prompt (Please + bookshelf benign; tasks 1-45)."
+            "pot: PoT planning backdoor in system prompt (Please + bookshelf benign; tasks 1-45); "
+            "mp: episodic memory poisoning from data/memory/risk.json "
+            "(rank-1 risk memory per task_index; tasks 1-45)."
         ),
     )
     parser.add_argument(
@@ -967,7 +1079,8 @@ def parse_args() -> argparse.Namespace:
             "dpi adversarial: benign + justified hazard; "
             "origin: hazard task only (no bookshelf benign prefix). "
             "opi appends styled hazard text to the first actionable tool observation. "
-            "rts/rte use per-category decoy user input; pot uses Please + bookshelf benign; RTE skips agent."
+            "rts/rte use per-category decoy user input; pot uses Please + bookshelf benign; "
+            "mp uses benign user input with seeded episodic poison; RTE skips agent."
         ),
     )
     parser.add_argument(
@@ -1110,6 +1223,13 @@ def main() -> None:
                 file=sys.stderr,
             )
         require_planning = True
+    if args.attack == "mp":
+        if not require_planning:
+            print(
+                "Warning: --attack mp enables --require-planning (forced episodic search precedes planning).\n",
+                file=sys.stderr,
+            )
+        require_planning = True
 
     run_metadata = build_run_metadata(
         argv=sys.argv,
@@ -1189,6 +1309,7 @@ def main() -> None:
             env_tracer=env_tracer,
             recover_tracker=recover_tracker,
             guard_collector=guard_collector,
+            attack=args.attack,
         )
 
     rte_guard_client: GuardAgentClient | None = None
@@ -1250,12 +1371,14 @@ def main() -> None:
             if batch_result_writer is not None:
                 batch_result_writer.finalize(recover_total=recover_ok)
             return
-        if args.attack in ("rts", "rte", "pot"):
+        if args.attack in ("rts", "rte", "pot", "mp"):
             validate_decoy_attack_batch_range(args.start, run_count)
-        if args.attack in ("rte", "pot") and not args.embodied:
+        if args.attack in ("rte", "pot", "mp") and not args.embodied:
             raise SystemExit(f"--attack {args.attack} requires --embodied.")
         if args.attack == "pot" and not require_planning:
             raise SystemExit("--attack pot requires planning (use --require-planning).")
+        if args.attack == "mp" and not require_planning:
+            raise SystemExit("--attack mp requires planning (use --require-planning).")
         print(
             f"Batch range: tasks {args.start}..{args.start + run_count - 1} "
             f"({run_count} total), attack={args.attack}, style={args.style}\n",
@@ -1283,6 +1406,7 @@ def main() -> None:
             debug_timing=debug_timing,
             agent_builder=pot_agent_builder,
             result_writer=batch_result_writer,
+            require_planning=require_planning,
         )
         print_batch_summary(
             total,

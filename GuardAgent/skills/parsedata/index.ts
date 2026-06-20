@@ -16,7 +16,7 @@ export type {
 
 /** Virtual path to the injection pattern catalog in the agent filesystem. */
 export const INJECTION_PATTERNS_JSON_PATH =
-  "/skills/prasedata/resources/injection-patterns.json";
+  "/skills/parsedata/resources/injection-patterns.json";
 
 function normalizeForMatch(text: string): string {
   return text.toLowerCase();

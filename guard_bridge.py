@@ -127,6 +127,19 @@ def stage_has_guard_skill(stage: str) -> bool:
     return normalize_stage(stage) in registered
 
 
+def guard_skill_name_for_stage(stage: str) -> str | None:
+    """Registered Guard skill name for a pipeline stage, or None if unregistered."""
+    if not stage_has_guard_skill(stage):
+        return None
+    _ensure_guardagent_import_path()
+    from stage_skills import load_registry, normalize_stage
+
+    try:
+        return load_registry().skill_for_stage(normalize_stage(stage))
+    except KeyError:
+        return None
+
+
 @dataclass(frozen=True)
 class TaskGuardMetrics:
     recover_triggered: bool

@@ -14,7 +14,7 @@ def _reasoning_content_from_message(msg: Any) -> str | None:
         return None
 
     reasoning = msg.additional_kwargs.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning:
+    if isinstance(reasoning, str):
         return reasoning
 
     content = msg.content
@@ -23,8 +23,18 @@ def _reasoning_content_from_message(msg: Any) -> str | None:
             if not isinstance(block, dict) or block.get("type") != "reasoning":
                 continue
             text = block.get("reasoning") or block.get("text")
-            if isinstance(text, str) and text:
+            if isinstance(text, str):
                 return text
+    return None
+
+
+def _reasoning_content_for_payload(msg: Any, msg_dict: dict[str, Any]) -> str | None:
+    reasoning = _reasoning_content_from_message(msg)
+    if reasoning is not None:
+        return reasoning
+    # DeepSeek thinking mode requires reasoning_content on tool-call assistant turns.
+    if msg_dict.get("tool_calls"):
+        return ""
     return None
 
 
@@ -49,10 +59,14 @@ def apply_deepseek_reasoning_payload_patch() -> None:
             return payload
 
         lc_messages = self._convert_input(input_).to_messages()
-        for msg_dict, msg in zip(messages, lc_messages, strict=False):
-            if msg_dict.get("role") != "assistant" or not isinstance(msg, AIMessage):
-                continue
-            reasoning = _reasoning_content_from_message(msg)
+        assistant_payload = [
+            message for message in messages if message.get("role") == "assistant"
+        ]
+        assistant_lc = [
+            message for message in lc_messages if isinstance(message, AIMessage)
+        ]
+        for msg_dict, msg in zip(assistant_payload, assistant_lc, strict=False):
+            reasoning = _reasoning_content_for_payload(msg, msg_dict)
             if reasoning is not None:
                 msg_dict["reasoning_content"] = reasoning
         return payload

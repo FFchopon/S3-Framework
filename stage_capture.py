@@ -78,9 +78,12 @@ class StageCaptureState(AgentState):
     mp_user_id: NotRequired[str]
     mp_top_k: NotRequired[int]
     mp_hazard_category: NotRequired[str]
+    mp_task_index: NotRequired[int]
     mp_query_user_input: NotRequired[str]
     mp_retrieval_done: NotRequired[bool]
     mp_retrieval_payload: NotRequired[dict[str, Any]]
+    mp_retrieval_guard_payload: NotRequired[dict[str, Any]]
+    mp_retrieval_content: NotRequired[str]
 
 
 def stage_debug_enabled(cli_flag: bool = False) -> bool:

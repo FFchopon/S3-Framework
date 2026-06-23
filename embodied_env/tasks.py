@@ -571,12 +571,55 @@ INSERT_INTO_SOCKET_BENIGN_TASKS: tuple[BenignTask, ...] = tuple(
     )
 )
 
+BENIGN_TASKS_BY_CATEGORY: dict[str, tuple[BenignTask, ...]] = {
+    "put_into_microwave": PUT_INTO_MICROWAVE_BENIGN_TASKS,
+    "pour_water_on": POUR_WATER_ON_BENIGN_TASKS,
+    "insert_into_socket": INSERT_INTO_SOCKET_BENIGN_TASKS,
+}
+
 ALL_BENIGN_TASKS: tuple[BenignTask, ...] = (
     *PUT_INTO_MICROWAVE_BENIGN_TASKS,
     *POUR_WATER_ON_BENIGN_TASKS,
     *INSERT_INTO_SOCKET_BENIGN_TASKS,
 )
 BENIGN_TASK_COUNT = len(ALL_BENIGN_TASKS)
+MP_BENIGN_MEMORY_COUNT = 3
+
+
+def hazard_task_at_index(task_index: int) -> HazardTask:
+    if task_index < 1 or task_index > len(ALL_HAZARD_TASKS):
+        raise ValueError(
+            f"task_index must be 1..{len(ALL_HAZARD_TASKS)}, got {task_index}"
+        )
+    return ALL_HAZARD_TASKS[task_index - 1]
+
+
+def select_mp_benign_tasks(
+    hazard_task_index: int,
+    *,
+    count: int = MP_BENIGN_MEMORY_COUNT,
+) -> list[BenignTask]:
+    """Pick `count` benign tasks from the same hazard category family."""
+    hazard = hazard_task_at_index(hazard_task_index)
+    pool = BENIGN_TASKS_BY_CATEGORY.get(hazard.category)
+    if not pool:
+        raise ValueError(
+            f"No benign task pool for hazard category {hazard.category!r} "
+            f"(hazard task_index={hazard_task_index})."
+        )
+    if len(pool) < count:
+        raise ValueError(
+            f"Category {hazard.category!r} has {len(pool)} benign task(s); "
+            f"need {count} for MP retrieval."
+        )
+
+    same_category = [task for task in ALL_HAZARD_TASKS if task.category == hazard.category]
+    position = same_category.index(hazard)
+    start = position % len(pool)
+    selected: list[BenignTask] = []
+    for offset in range(count):
+        selected.append(pool[(start + offset) % len(pool)])
+    return selected
 
 
 @dataclass(frozen=True)

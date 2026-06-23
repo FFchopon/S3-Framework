@@ -40,7 +40,20 @@ class Episode:
     is_poison: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_retrieval_dict(self, *, rank: int) -> dict[str, Any]:
+    def to_agent_episode_dict(self, *, rank: int) -> dict[str, Any]:
+        """Main Agent retrieval view: no poison/benign labels or eval metadata."""
+        return {
+            "rank": rank,
+            "user_input": self.user_input,
+            "generated_plan": self.generated_plan,
+        }
+
+    def to_observation_dict(self, *, rank: int) -> dict[str, Any]:
+        """Alias for agent-facing retrieval episode fields."""
+        return self.to_agent_episode_dict(rank=rank)
+
+    def to_internal_retrieval_dict(self, *, rank: int) -> dict[str, Any]:
+        """Guard / experiment metadata (not shown to Main Agent)."""
         return {
             "rank": rank,
             "episode_id": self.episode_id,
@@ -54,16 +67,13 @@ class Episode:
             "metadata": dict(self.metadata),
         }
 
-    def to_observation_dict(self, *, rank: int) -> dict[str, Any]:
-        return {
-            "rank": rank,
-            "user_input": self.user_input,
-            "generated_plan": self.generated_plan,
-        }
+    def to_retrieval_dict(self, *, rank: int) -> dict[str, Any]:
+        """Backward-compatible alias for internal retrieval metadata."""
+        return self.to_internal_retrieval_dict(rank=rank)
 
 
 class EpisodeRegistry:
-    """Episodes scoped by eval user_id; retrieval returns rank-1 risk memory only."""
+    """Episodes scoped by eval user_id; retrieval order: rank 1 risk, ranks 2–4 benign."""
 
     def __init__(self) -> None:
         self._episodes: dict[tuple[str, str], Episode] = {}
@@ -91,8 +101,16 @@ class EpisodeRegistry:
         return episodes
 
     def list_retrieval(self, user_id: str) -> list[dict[str, Any]]:
+        """Internal retrieval metadata for guard / experiment logging."""
         return [
-            episode.to_retrieval_dict(rank=index)
+            episode.to_internal_retrieval_dict(rank=index)
+            for index, episode in enumerate(self.list_user_episodes(user_id), start=1)
+        ]
+
+    def list_agent_retrieval(self, user_id: str) -> list[dict[str, Any]]:
+        """Agent-visible retrieval episodes (no poison/benign labels)."""
+        return [
+            episode.to_agent_episode_dict(rank=index)
             for index, episode in enumerate(self.list_user_episodes(user_id), start=1)
         ]
 
@@ -109,7 +127,7 @@ class EpisodeRegistry:
             return []
         limit = min(max(1, top_k), MP_MEMORY_TOP_K)
         return [
-            episode.to_retrieval_dict(rank=index)
+            episode.to_internal_retrieval_dict(rank=index)
             for index, episode in enumerate(episodes[:limit], start=1)
         ]
 

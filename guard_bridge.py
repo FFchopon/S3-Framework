@@ -46,7 +46,7 @@ _EMBODIED_WORLD_RE = re.compile(
     rf"{re.escape(EMBODIED_WORLD_BEGIN)}\s*(\{{.*?\}})\s*{re.escape(EMBODIED_WORLD_END)}",
     re.DOTALL,
 )
-_RECOVER_STAGES = frozenset({"input", "planning", "tool_selection", "tool_observation"})
+_RECOVER_STAGES = frozenset({"input", "planning", "tool_selection", "tool_observation", "memory"})
 # Embodied world is exported only from the recover subprocess (incident response).
 _EMBODIED_WORLD_APPLY_STAGES = frozenset({"recover"})
 _pipeline_guard_stages: frozenset[str] | None = None

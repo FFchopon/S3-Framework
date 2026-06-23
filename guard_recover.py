@@ -106,6 +106,8 @@ def extract_original_content(stage: str, payload: Any) -> Any:
             if isinstance(record, dict) and isinstance(record.get("content"), str):
                 return record["content"]
         return payload
+    if stage == "memory":
+        return payload
     return payload
 
 
@@ -788,6 +790,11 @@ def apply_recover_patch(messages: list[AnyMessage], patch: RecoverPatch) -> list
         return _replace_pending_tool_calls(messages, content)
     if stage == "planning":
         return _replace_write_todos_args(messages, content)
+    if stage == "memory" and isinstance(content, str):
+        return _replace_latest_tool_observations(
+            messages,
+            [{"name": "search_past_conversations", "content": content}],
+        )
     return messages
 
 
@@ -815,6 +822,9 @@ def state_update_for_recover(
         if regenerate_instruction.strip():
             patch["guard_regenerate_instruction"] = regenerate_instruction.strip()
         return patch
+
+    if stage == "memory" and isinstance(content, str):
+        return {"mp_retrieval_content": content}
 
     updated = apply_recover_patch(messages, RecoverPatch(stage=stage, content=content))
     if updated == messages:

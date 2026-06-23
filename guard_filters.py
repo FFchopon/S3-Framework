@@ -310,6 +310,26 @@ def _agentspec_tool_selection_filter(stage: str, payload: Any) -> GuardFilterRes
     )
 
 
+def _a_memguard_retrieval_filter(stage: str, payload: Any) -> GuardFilterResult:
+    if stage != "memory":
+        return GuardFilterResult(should_invoke=True)
+    if not isinstance(payload, dict):
+        return GuardFilterResult(should_invoke=False, reason="a-memguard: empty payload")
+    retrieval = payload.get("retrieval")
+    if not isinstance(retrieval, dict):
+        return GuardFilterResult(should_invoke=False, reason="a-memguard: missing retrieval block")
+    episodes = retrieval.get("episodes")
+    if not isinstance(episodes, list) or len(episodes) < 2:
+        return GuardFilterResult(
+            should_invoke=False,
+            reason="a-memguard: need 2+ episodes for consensus comparison",
+        )
+    return GuardFilterResult(
+        should_invoke=True,
+        reason=f"a-memguard: compare {len(episodes)} retrieved memories",
+    )
+
+
 def _ensure_guardagent_import_path() -> None:
     import sys
 
@@ -354,6 +374,7 @@ def evaluate_guard_filter(stage: str, payload: Any) -> GuardFilterResult:
 def _register_builtin_filters() -> None:
     register_skill_filter("air", _air_post_step_filter)
     register_skill_filter("agentspec", _agentspec_tool_selection_filter)
+    register_skill_filter("a-memguard", _a_memguard_retrieval_filter)
 
 
 _register_builtin_filters()

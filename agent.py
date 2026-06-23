@@ -65,8 +65,11 @@ from guard_bridge import (
 from guard_filters import guard_filter_enabled
 from guard_payloads import (
     PARSEDATA_SKILL_NAME,
+    build_memory_retrieval_guard_payload,
     build_parsedata_tool_observation_payload,
+    build_sanitized_memory_observation,
     filter_tool_observations_for_guard,
+    parse_deviant_ranks,
 )
 from guard_recover import GUARD_RECOVER_SYSTEM_PROMPT, state_update_for_recover
 from result_writer import (
@@ -328,6 +331,7 @@ def build_agent(
                         "planning",
                         "tool_selection",
                         "tool_observation",
+                        "memory",
                     ):
                         extra = (
                             f" patched={result.outcome.recovered_content is not None}"
@@ -406,22 +410,60 @@ def build_agent(
             guard_check("output", model_output)
 
         def on_memory_retrieval(
-            retrieval_payload: dict[str, Any], messages: list
+            retrieval_payload: dict[str, Any],
+            messages: list,
+            state: dict[str, Any],
         ) -> dict[str, Any] | None:
-            result = guard_check("memory", retrieval_payload)
+            guard_payload = build_memory_retrieval_guard_payload(
+                retrieval_payload,
+                pipeline_context={
+                    "attack": state.get("attack_type"),
+                    "user_message": state.get("mp_query_user_input"),
+                    "query": retrieval_payload.get("query"),
+                    "task_index": state.get("mp_task_index"),
+                    "hazard_category": state.get("mp_hazard_category"),
+                    "user_id": retrieval_payload.get("user_id"),
+                    "top_k": retrieval_payload.get("top_k"),
+                },
+            )
+            result = guard_check("memory", guard_payload)
+            patch: dict[str, Any] = {"mp_retrieval_guard_payload": guard_payload}
             if result.halt_main_agent:
-                return {"guard_incident_halt": True}
-            if result.outcome and result.outcome.recovered_content is not None:
-                sanitized = result.outcome.recovered_content
+                patch["guard_incident_halt"] = True
+                return patch
+            if result.outcome and result.outcome.decision == "recover":
+                sanitized = (
+                    result.outcome.recovered_content
+                    if result.outcome.recovered_content is not None
+                    else None
+                )
                 if isinstance(sanitized, str):
-                    return {"mp_retrieval_content": sanitized}
+                    patch["mp_retrieval_content"] = sanitized
+                    return patch
                 if isinstance(sanitized, dict):
-                    return {
-                        "mp_retrieval_content": json.dumps(
+                    if sanitized.get("episodes") is not None:
+                        patch["mp_retrieval_content"] = json.dumps(
                             sanitized, ensure_ascii=False
                         )
-                    }
-            return None
+                        return patch
+                    if sanitized.get("retrieval") is not None:
+                        patch["mp_retrieval_content"] = build_sanitized_memory_observation(
+                            sanitized
+                        )
+                        return patch
+                recommendation = result.outcome.recover_recommendation
+                deviant_ranks = parse_deviant_ranks(
+                    result.content
+                    + "\n"
+                    + (recommendation.triggered_pattern if recommendation else "")
+                )
+                if deviant_ranks:
+                    patch["mp_retrieval_content"] = build_sanitized_memory_observation(
+                        guard_payload,
+                        drop_ranks=deviant_ranks,
+                    )
+                    return patch
+            return patch
 
     enable_episodic = attack == "mp"
     on_memory_retrieval_cb = on_memory_retrieval if enable_guard and enable_episodic else None
@@ -546,7 +588,7 @@ def run_embodied_batch(
         if env_tracer is not None:
             env_tracer.reset_baseline()
 
-        user_message = build_user_message_for_attack(prompt, attack)
+        user_message = build_user_message_for_attack(prompt, attack, task_index=task_index)
         attack_state = initial_attack_state(
             prompt,
             attack=attack,
@@ -1064,8 +1106,8 @@ def parse_args() -> argparse.Namespace:
             "rte: skip main agent; god-mode per-task hazard world state (tasks 1-45); "
             "with --guard runs AIR post_step on simulated hazard tool; "
             "pot: PoT planning backdoor in system prompt (Please + bookshelf benign; tasks 1-45); "
-            "mp: episodic memory poisoning from data/memory/risk.json "
-            "(rank-1 risk memory per task_index; tasks 1-45)."
+            "mp: episodic memory poisoning from data/memory/risk.json + benign.json "
+            "(rank-1 risk by task_index + 3 random same-family benign memories; tasks 1-45)."
         ),
     )
     parser.add_argument(

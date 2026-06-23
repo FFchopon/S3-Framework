@@ -21,16 +21,17 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 # Canonical Main Agent stages (extend as new safety skills are added).
 STAGE_INPUT = "input"
 STAGE_PLANNING = "planning"
+STAGE_MEMORY = "memory"
 STAGE_TOOL_OBSERVATION = "tool_observation"
 RECOVER_STAGE = "recover"
 
 KNOWN_STAGES = (
     STAGE_INPUT,
+    STAGE_MEMORY,
     STAGE_PLANNING,
     STAGE_TOOL_OBSERVATION,
     # Reserved for later Guard skills:
     # "post_step",
-    # "memory",
     # "tool_selection",
     # "tool_execution",
     # "output",

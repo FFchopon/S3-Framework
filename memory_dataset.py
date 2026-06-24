@@ -11,6 +11,7 @@ from typing import Any, Literal
 from embodied_env.tasks import (
     BENIGN_TASKS_BY_CATEGORY,
     MP_BENIGN_MEMORY_COUNT,
+    PromptStyle,
     hazard_task_at_index,
 )
 
@@ -18,8 +19,28 @@ MemoryKind = Literal["benign", "risk"]
 
 DATA_DIR = Path(__file__).resolve().parent / "data" / "memory"
 DEFAULT_BENIGN_PATH = DATA_DIR / "benign.json"
-DEFAULT_RISK_PATH = DATA_DIR / "risk.json"
+RISK_NAIVE_PATH = DATA_DIR / "risk_naive.json"
+RISK_ADAPTIVE_PATH = DATA_DIR / "risk_adaptve.json"
+DEFAULT_RISK_PATH = RISK_NAIVE_PATH
+MP_RISK_MEMORY_PATH_BY_STYLE: dict[str, Path] = {
+    "naive": RISK_NAIVE_PATH,
+    "adaptive": RISK_ADAPTIVE_PATH,
+}
 MP_MEMORY_TOP_K = 1 + MP_BENIGN_MEMORY_COUNT
+
+
+def mp_risk_memory_path(style: PromptStyle) -> Path:
+    """Risk memory JSON for MP experiments keyed by prompt style."""
+    path = MP_RISK_MEMORY_PATH_BY_STYLE.get(style)
+    if path is None:
+        supported = ", ".join(sorted(MP_RISK_MEMORY_PATH_BY_STYLE))
+        raise ValueError(
+            f"MP attack has no risk memory corpus for style={style!r}. "
+            f"Supported styles: {supported}"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"MP risk memory file not found: {path}")
+    return path
 
 
 def format_generated_plan(plan: Any) -> str:
@@ -274,8 +295,11 @@ class MemoryDataset:
         cls,
         *,
         benign_path: Path = DEFAULT_BENIGN_PATH,
-        risk_path: Path = DEFAULT_RISK_PATH,
+        risk_path: Path | None = None,
+        style: PromptStyle | None = None,
     ) -> MemoryDataset:
+        if risk_path is None:
+            risk_path = mp_risk_memory_path(style) if style is not None else DEFAULT_RISK_PATH
         return cls(
             benign_by_category=load_benign_records_by_category(benign_path),
             risk=load_memory_records(risk_path),

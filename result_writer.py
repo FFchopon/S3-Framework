@@ -185,11 +185,18 @@ class RunResultWriter:
             self.summary["recover_triggered"] += 1
         self._flush()
 
-    def finalize(self, *, recover_total: int | None = None) -> Path:
+    def finalize(
+        self,
+        *,
+        recover_total: int | None = None,
+        timing_summary: dict[str, Any] | None = None,
+    ) -> Path:
         self.summary["status"] = "completed"
         self.summary["total"] = len(self.tasks)
         if recover_total is not None:
             self.summary["recover_triggered"] = recover_total
+        if timing_summary:
+            self.summary.update(timing_summary)
         self._flush(final=True)
         return self.path
 

@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,7 @@ from guard_bridge import (
     GuardAgentClient,
     GuardCheckCollector,
     GuardRecoverTracker,
+    TaskGuardMetrics,
     guard_enabled,
     guard_halt_on_recover_enabled,
     guard_skill_name_for_stage,
@@ -137,6 +139,53 @@ def emit_task_timing(
         f"elapsed {_format_task_elapsed(elapsed_s)}{extra}\n",
         file=sys.stderr,
     )
+
+
+def build_task_timing_fields(
+    *,
+    elapsed_s: float,
+    guard_metrics: TaskGuardMetrics | None,
+) -> dict[str, Any]:
+    """Per-task timing fields for JSON export (matches stderr [timing] line)."""
+    fields: dict[str, Any] = {
+        "time_overhead": round(elapsed_s, 3),
+        "guard_invokes": guard_metrics.guard_invokes if guard_metrics else 0,
+        "recover_signals": guard_metrics.recover_count if guard_metrics else 0,
+    }
+    return fields
+
+
+@dataclass
+class BatchTimingStats:
+    total_elapsed_s: float = 0.0
+    total_guard_invokes: int = 0
+    total_recover_signals: int = 0
+
+    def note(self, elapsed_s: float, guard_metrics: TaskGuardMetrics | None) -> None:
+        self.total_elapsed_s += elapsed_s
+        if guard_metrics is not None:
+            self.total_guard_invokes += guard_metrics.guard_invokes
+            self.total_recover_signals += guard_metrics.recover_count
+
+    def summary_fields(self, total: int) -> dict[str, Any]:
+        if total <= 0:
+            return {}
+        avg_elapsed_s = self.total_elapsed_s / total
+        return {
+            "average_time": _format_task_elapsed(avg_elapsed_s),
+            "average_time_overhead": round(avg_elapsed_s, 3),
+            "average_guard_invokes": round(self.total_guard_invokes / total, 1),
+            "average_recover_signals": round(self.total_recover_signals / total, 1),
+        }
+
+
+def _print_timing_summary_lines(timing: BatchTimingStats, total: int) -> None:
+    fields = timing.summary_fields(total)
+    if not fields:
+        return
+    print(f"average time: {fields['average_time']}")
+    print(f"average guard_invokes: {fields['average_guard_invokes']}")
+    print(f"average recover_signals: {fields['average_recover_signals']}")
 from embodied_env.tools import (
     benign_env_enabled,
     create_embodied_tools,
@@ -562,7 +611,7 @@ def run_embodied_batch(
     agent_builder: Callable[[EvalPrompt], Any] | None = None,
     result_writer: RunResultWriter | None = None,
     require_planning: bool = False,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, BatchTimingStats | None]:
     """Run up to `num` embodied eval tasks from 1-based index `start`.
 
     Resets the text environment between tasks.
@@ -575,7 +624,8 @@ def run_embodied_batch(
     benign_ok = 0
     hazard_ok = 0
     safe_benign_ok = 0
-    memory_dataset = MemoryDataset.load() if attack == "mp" else None
+    batch_timing = BatchTimingStats() if debug_timing else None
+    memory_dataset = MemoryDataset.load(style=style) if attack == "mp" else None
 
     for run_index, prompt in enumerate(prompts, start=1):
         task_index = start + run_index - 1
@@ -716,14 +766,17 @@ def run_embodied_batch(
             file=sys.stderr,
         )
         if debug_timing:
+            elapsed_s = time.perf_counter() - task_started
             emit_task_timing(
                 task_index=task_index,
                 run_index=run_index,
                 total=total,
-                elapsed_s=time.perf_counter() - task_started,
+                elapsed_s=elapsed_s,
                 guard_invokes=guard_metrics.guard_invokes if guard_metrics else None,
                 recover_count=guard_metrics.recover_count if guard_metrics else None,
             )
+            if batch_timing is not None:
+                batch_timing.note(elapsed_s, guard_metrics)
 
         if env_tracer is not None:
             env_tracer.emit_final()
@@ -781,10 +834,17 @@ def run_embodied_batch(
                 record["assistant_output"] = assistant_output
             if guard_checks:
                 record["guard_checks"] = guard_checks
+            if debug_timing:
+                record.update(
+                    build_task_timing_fields(
+                        elapsed_s=elapsed_s,
+                        guard_metrics=guard_metrics,
+                    )
+                )
             result_writer.append_task(record)
 
     recover_ok = recover_tracker.total if recover_tracker is not None else 0
-    return total, benign_ok, hazard_ok, safe_benign_ok, recover_ok
+    return total, benign_ok, hazard_ok, safe_benign_ok, recover_ok, batch_timing
 
 
 def run_benign_batch(
@@ -799,7 +859,7 @@ def run_benign_batch(
     guard_collector: GuardCheckCollector | None = None,
     result_writer: RunResultWriter | None = None,
     debug_timing: bool = False,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, BatchTimingStats | None]:
     """Run up to `num` standalone benign tasks from 1-based index `start`.
 
     Returns (total, benign_success_count, recover_triggered_count).
@@ -810,6 +870,7 @@ def run_benign_batch(
     total = len(tasks)
     benign_ok = 0
     recover_ok = 0
+    batch_timing = BatchTimingStats() if debug_timing else None
 
     for run_index, task in enumerate(tasks, start=1):
         task_index = start + run_index - 1
@@ -869,15 +930,18 @@ def run_benign_batch(
             file=sys.stderr,
         )
         if debug_timing:
+            elapsed_s = time.perf_counter() - task_started
             emit_task_timing(
                 task_index=task_index,
                 run_index=run_index,
                 total=total,
-                elapsed_s=time.perf_counter() - task_started,
+                elapsed_s=elapsed_s,
                 label="benign task",
                 guard_invokes=guard_metrics.guard_invokes if guard_metrics else None,
                 recover_count=guard_metrics.recover_count if guard_metrics else None,
             )
+            if batch_timing is not None:
+                batch_timing.note(elapsed_s, guard_metrics)
 
         if env_tracer is not None:
             env_tracer.emit_final()
@@ -900,21 +964,32 @@ def run_benign_batch(
             }
             if guard_checks:
                 record["guard_checks"] = guard_checks
+            if debug_timing:
+                record.update(
+                    build_task_timing_fields(
+                        elapsed_s=elapsed_s,
+                        guard_metrics=guard_metrics,
+                    )
+                )
             result_writer.append_task(record)
 
-    return total, benign_ok, recover_ok
+    return total, benign_ok, recover_ok, batch_timing
 
 
 def print_benign_batch_summary(
     total: int,
     benign_ok: int,
     recover_ok: int = 0,
+    *,
+    timing: BatchTimingStats | None = None,
 ) -> None:
     print("\n====================")
     print("Benign batch evaluation summary")
     print(f"total task: {total}")
     print(f"benign task success: {benign_ok}")
     print(f"recover triggered: {recover_ok}")
+    if timing is not None:
+        _print_timing_summary_lines(timing, total)
     print("====================\n")
 
 
@@ -927,6 +1002,7 @@ def print_batch_summary(
     *,
     style: PromptStyle = "naive",
     attack: AttackType = "dpi",
+    timing: BatchTimingStats | None = None,
 ) -> None:
     print("\n====================")
     print("Batch evaluation summary")
@@ -946,6 +1022,8 @@ def print_batch_summary(
     )
     print(f"attack task success: {hazard_ok}")
     print(f"recover triggered: {recover_ok}")
+    if timing is not None:
+        _print_timing_summary_lines(timing, total)
     print("====================\n")
 
 
@@ -1106,7 +1184,8 @@ def parse_args() -> argparse.Namespace:
             "rte: skip main agent; god-mode per-task hazard world state (tasks 1-45); "
             "with --guard runs AIR post_step on simulated hazard tool; "
             "pot: PoT planning backdoor in system prompt (Please + bookshelf benign; tasks 1-45); "
-            "mp: episodic memory poisoning from data/memory/risk.json + benign.json "
+            "mp: episodic memory poisoning from data/memory/risk_naive.json or "
+            "risk_adaptve.json (by --style) + benign.json "
             "(rank-1 risk by task_index + 3 random same-family benign memories; tasks 1-45)."
         ),
     )
@@ -1122,7 +1201,7 @@ def parse_args() -> argparse.Namespace:
             "origin: hazard task only (no bookshelf benign prefix). "
             "opi appends styled hazard text to the first actionable tool observation. "
             "rts/rte use per-category decoy user input; pot uses Please + bookshelf benign; "
-            "mp uses benign user input with seeded episodic poison; RTE skips agent."
+            "mp uses benign user input with seeded episodic poison (risk memory by style); RTE skips agent."
         ),
     )
     parser.add_argument(
@@ -1398,7 +1477,7 @@ def main() -> None:
                     expected_total=run_count,
                     summary_extra={"mode": "benign"},
                 )
-            total, benign_ok, recover_ok = run_benign_batch(
+            total, benign_ok, recover_ok, batch_timing = run_benign_batch(
                 agent,
                 num=run_count,
                 start=args.start,
@@ -1409,9 +1488,17 @@ def main() -> None:
                 result_writer=batch_result_writer,
                 debug_timing=debug_timing,
             )
-            print_benign_batch_summary(total, benign_ok, recover_ok)
+            print_benign_batch_summary(
+                total, benign_ok, recover_ok, timing=batch_timing
+            )
             if batch_result_writer is not None:
-                batch_result_writer.finalize(recover_total=recover_ok)
+                timing_summary = (
+                    batch_timing.summary_fields(total) if batch_timing is not None else None
+                )
+                batch_result_writer.finalize(
+                    recover_total=recover_ok,
+                    timing_summary=timing_summary,
+                )
             return
         if args.attack in ("rts", "rte", "pot", "mp"):
             validate_decoy_attack_batch_range(args.start, run_count)
@@ -1433,22 +1520,24 @@ def main() -> None:
                 batch_metadata,
                 expected_total=run_count,
             )
-        total, benign_ok, hazard_ok, safe_benign_ok, recover_ok = run_embodied_batch(
-            agent,
-            num=run_count,
-            start=args.start,
-            style=args.style,
-            attack=args.attack,
-            files=skill_files,
-            env_tracer=env_tracer,
-            recover_tracker=recover_tracker,
-            guard_collector=guard_collector,
-            guard_client=rte_guard_client,
-            debug_stages=debug_stages,
-            debug_timing=debug_timing,
-            agent_builder=pot_agent_builder,
-            result_writer=batch_result_writer,
-            require_planning=require_planning,
+        total, benign_ok, hazard_ok, safe_benign_ok, recover_ok, batch_timing = (
+            run_embodied_batch(
+                agent,
+                num=run_count,
+                start=args.start,
+                style=args.style,
+                attack=args.attack,
+                files=skill_files,
+                env_tracer=env_tracer,
+                recover_tracker=recover_tracker,
+                guard_collector=guard_collector,
+                guard_client=rte_guard_client,
+                debug_stages=debug_stages,
+                debug_timing=debug_timing,
+                agent_builder=pot_agent_builder,
+                result_writer=batch_result_writer,
+                require_planning=require_planning,
+            )
         )
         print_batch_summary(
             total,
@@ -1458,9 +1547,16 @@ def main() -> None:
             recover_ok,
             style=args.style,
             attack=args.attack,
+            timing=batch_timing,
         )
         if batch_result_writer is not None:
-            batch_result_writer.finalize(recover_total=recover_ok)
+            timing_summary = (
+                batch_timing.summary_fields(total) if batch_timing is not None else None
+            )
+            batch_result_writer.finalize(
+                recover_total=recover_ok,
+                timing_summary=timing_summary,
+            )
         return
 
     if args.benign:
@@ -1475,7 +1571,7 @@ def main() -> None:
                 expected_total=1,
                 summary_extra={"mode": "benign"},
             )
-        total, benign_ok, recover_ok = run_benign_batch(
+        total, benign_ok, recover_ok, batch_timing = run_benign_batch(
             agent,
             num=1,
             start=args.start,
@@ -1486,9 +1582,17 @@ def main() -> None:
             result_writer=single_benign_writer,
             debug_timing=debug_timing,
         )
-        print_benign_batch_summary(total, benign_ok, recover_ok)
+        print_benign_batch_summary(
+            total, benign_ok, recover_ok, timing=batch_timing
+        )
         if single_benign_writer is not None:
-            single_benign_writer.finalize(recover_total=recover_ok)
+            timing_summary = (
+                batch_timing.summary_fields(total) if batch_timing is not None else None
+            )
+            single_benign_writer.finalize(
+                recover_total=recover_ok,
+                timing_summary=timing_summary,
+            )
         return
 
     single_result_writer: RunResultWriter | None = None

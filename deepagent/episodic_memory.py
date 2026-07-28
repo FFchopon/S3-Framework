@@ -11,13 +11,13 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, Mod
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
-from episode_store import (
+from .episode_store import (
     EPISODE_REGISTRY,
     EpisodeRegistry,
     get_active_episode_user_id,
 )
-from memory_dataset import MP_MEMORY_TOP_K
-from stage_capture import StageCaptureState, _apply_guard_incident_halt, emit_stage_debug
+from .memory_dataset import MP_MEMORY_TOP_K
+from .stage_capture import StageCaptureState, _apply_guard_incident_halt, emit_stage_debug
 
 SEARCH_PAST_CONVERSATIONS_TOOL_NAME = "search_past_conversations"
 STAGE_MEMORY = "memory"

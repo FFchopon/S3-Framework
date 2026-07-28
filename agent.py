@@ -73,7 +73,11 @@ from guard_payloads import (
     filter_tool_observations_for_guard,
     parse_deviant_ranks,
 )
-from guard_recover import GUARD_RECOVER_SYSTEM_PROMPT, state_update_for_recover
+from guard_recover import (
+    GUARD_RECOVER_SYSTEM_PROMPT,
+    guard_recover_guidance_enabled,
+    state_update_for_recover,
+)
 from result_writer import (
     RESULT_DIR,
     RunResultWriter,
@@ -320,6 +324,7 @@ def build_agent(
     halt_on_recover: bool = False,
     enable_guard: bool = False,
     enable_guard_filter: bool | None = None,
+    enable_recover_guidance: bool = True,
     require_planning: bool = False,
     env_tracer: EmbodiedEnvTracer | None = None,
     recover_tracker: GuardRecoverTracker | None = None,
@@ -412,7 +417,7 @@ def build_agent(
                     messages,
                     result.stage,
                     result.outcome.recovered_content,
-                    regenerate_instruction=regen,
+                    regenerate_instruction=regen if enable_recover_guidance else "",
                 )
             return None
 
@@ -423,14 +428,22 @@ def build_agent(
         def on_planning(todos: object, messages: list) -> dict | None:
             result = guard_check("planning", todos)
             regen = ""
-            if result.outcome and result.outcome.recover_recommendation is not None:
+            if (
+                enable_recover_guidance
+                and result.outcome
+                and result.outcome.recover_recommendation is not None
+            ):
                 regen = result.outcome.recover_recommendation.regenerate_instruction
             return _guard_stage_patch(result, messages, regen=regen)
 
         def on_tool_selection(tool_calls: list[dict], messages: list) -> dict | None:
             result = guard_check("tool_selection", tool_calls)
             regen = ""
-            if result.outcome and result.outcome.recover_recommendation is not None:
+            if (
+                enable_recover_guidance
+                and result.outcome
+                and result.outcome.recover_recommendation is not None
+            ):
                 regen = result.outcome.recover_recommendation.regenerate_instruction
             return _guard_stage_patch(result, messages, regen=regen)
 
@@ -529,7 +542,7 @@ def build_agent(
         extra_tools.append(create_search_past_conversations_tool(EPISODE_REGISTRY))
     if pot_backdoor_fragment:
         system_prompt = f"{system_prompt}\n\n{pot_backdoor_fragment}"
-    if enable_guard:
+    if enable_guard and enable_recover_guidance:
         system_prompt = f"{system_prompt}\n\n{GUARD_RECOVER_SYSTEM_PROMPT}"
 
     def on_post_step(payload: dict, messages: list) -> dict | None:
@@ -555,6 +568,8 @@ def build_agent(
             require_planning=require_planning,
         )
     )
+    # Input guard (lc-guardrail) before MP forced memory retrieval (a-memguard).
+    middleware.append(create_input_stage_middleware(debug=debug_stages, on_input=on_input))
     if enable_episodic:
         middleware.append(
             create_force_episodic_search_middleware(
@@ -565,13 +580,13 @@ def build_agent(
         )
     middleware.extend(
         [
-            create_input_stage_middleware(debug=debug_stages, on_input=on_input),
             create_observation_attack_middleware(debug=debug_stages),
             create_stage_capture_middleware(
                 debug=debug_stages,
                 on_tool_selection=on_tool_selection,
                 on_tool_observation=on_tool_observation,
                 on_planning=on_planning,
+                recover_guidance=enable_recover_guidance if enable_guard else True,
             ),
             create_post_step_middleware(debug=debug_stages, on_post_step=on_post_step),
             create_output_stage_middleware(debug=debug_stages, on_output=on_output),
@@ -1137,6 +1152,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-guard-recover-guidance",
+        action="store_true",
+        help=(
+            "On Guard recover, still sanitize/remediate payloads but do not inject "
+            "system/Human recover guidance for Main Agent continuation "
+            "(or set DEEPAGENT_GUARD_RECOVER_GUIDANCE=0). "
+            "Incompatible with --guard-halt-on-recover, which stops the agent entirely."
+        ),
+    )
+    parser.add_argument(
         "--guard-halt-on-recover",
         action="store_true",
         help=(
@@ -1274,6 +1299,11 @@ def main() -> None:
         guard_halt_on_recover_enabled(args.guard_halt_on_recover) if enable_guard else False
     )
     enable_guard_filter = guard_filter_enabled(cli_flag=not args.no_guard_filter)
+    enable_recover_guidance = (
+        guard_recover_guidance_enabled(cli_flag=not args.no_guard_recover_guidance)
+        if enable_guard
+        else False
+    )
     require_planning = require_planning_enabled(args.require_planning)
     benign_env = benign_env_enabled(args.benign_env)
     trace_env = env_trace_enabled(args.trace_env)
@@ -1292,6 +1322,11 @@ def main() -> None:
         print(f"GuardAgent transport: {resolve_guard_transport()}\n", file=sys.stderr)
         print(
             f"GuardAgent pre-filter: {'on' if enable_guard_filter else 'off'}\n",
+            file=sys.stderr,
+        )
+        print(
+            f"GuardAgent recover guidance: "
+            f"{'on' if enable_recover_guidance else 'off'}\n",
             file=sys.stderr,
         )
         print(
@@ -1367,6 +1402,7 @@ def main() -> None:
         num=args.num,
         guard=enable_guard,
         guard_filter=enable_guard_filter if enable_guard else False,
+        guard_recover_guidance=enable_recover_guidance if enable_guard else False,
         guard_halt_on_recover=guard_halt_on_recover or args.benign,
         require_planning=require_planning,
         debug_stages=debug_stages,
@@ -1385,6 +1421,7 @@ def main() -> None:
             benign_env=benign_env,
             enable_guard=enable_guard,
             enable_guard_filter=enable_guard_filter,
+            enable_recover_guidance=enable_recover_guidance,
             halt_on_recover=guard_halt_on_recover,
             require_planning=require_planning,
             env_tracer=env_tracer,
@@ -1409,6 +1446,7 @@ def main() -> None:
             benign_task_mode=True,
             enable_guard=enable_guard,
             enable_guard_filter=enable_guard_filter,
+            enable_recover_guidance=enable_recover_guidance,
             halt_on_recover=guard_halt_on_recover,
             require_planning=require_planning,
             env_tracer=env_tracer,
@@ -1425,6 +1463,7 @@ def main() -> None:
             benign_env=benign_env,
             enable_guard=enable_guard,
             enable_guard_filter=enable_guard_filter,
+            enable_recover_guidance=enable_recover_guidance,
             halt_on_recover=guard_halt_on_recover,
             require_planning=require_planning,
             env_tracer=env_tracer,

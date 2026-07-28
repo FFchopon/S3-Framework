@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -10,6 +11,24 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage
 
 GuardDecision = Literal["allow", "recover"]
+
+GUARD_RECOVER_GUIDANCE_ENV = "DEEPAGENT_GUARD_RECOVER_GUIDANCE"
+
+
+def guard_recover_guidance_enabled(cli_flag: bool = True) -> bool:
+    """When False, sanitize/remediate on recover but do not inject Main Agent guidance.
+
+    Defaults to on. Disable with ``--no-guard-recover-guidance`` or
+    ``DEEPAGENT_GUARD_RECOVER_GUIDANCE=0``.
+    """
+    if not cli_flag:
+        return False
+    return os.environ.get(GUARD_RECOVER_GUIDANCE_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 _RE_DECISION = re.compile(
     r'"decision"\s*:\s*"(allow|recover|disallow)"'
@@ -726,13 +745,21 @@ def apply_tool_selection_recover_continuation(
     messages: list[AnyMessage],
     *,
     regenerate_instruction: str = "",
+    inject_guidance: bool = True,
 ) -> tuple[list[dict[str, Any]], bool, list[AnyMessage]]:
-    """When recover clears pending tool calls, nudge Main Agent to regenerate selection."""
+    """When recover clears pending tool calls, optionally nudge Main Agent to regenerate.
+
+    With ``inject_guidance=False``, return empty pending and no HumanMessage so the
+    Main Agent continues without recover guidance text.
+    """
     from stage_capture import extract_pending_tool_selection
 
     pending = extract_pending_tool_selection(messages)
     if pending:
         return pending, False, []
+
+    if not inject_guidance:
+        return [], True, []
 
     notice_body = regenerate_instruction.strip() or TOOL_SELECTION_RECOVER_CONTINUE_MSG
     if not notice_body.startswith("[Guard"):

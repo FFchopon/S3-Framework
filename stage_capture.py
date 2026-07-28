@@ -249,6 +249,19 @@ def _apply_guard_incident_halt(updates: dict[str, Any]) -> None:
         updates["jump_to"] = "end"
 
 
+_GUARD_PATCH_SKIP_KEYS = frozenset({"guard_regenerate_instruction", "messages"})
+
+
+def _merge_guard_patch(updates: dict[str, Any], patch: dict[str, Any]) -> None:
+    updates.update(
+        {key: value for key, value in patch.items() if key not in _GUARD_PATCH_SKIP_KEYS}
+    )
+
+
+def _guard_patch_is_halt(patch: dict[str, Any]) -> bool:
+    return bool(patch.get("guard_incident_halt"))
+
+
 class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
     """Expose tool selection (after_model) and tool observation (before_model) in state."""
 
@@ -261,11 +274,13 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         on_tool_selection: OnToolSelectionCallback | None = None,
         on_tool_observation: OnToolObservationCallback | None = None,
         on_planning: OnPlanningCallback | None = None,
+        recover_guidance: bool = True,
     ) -> None:
         self._debug = debug
         self._on_tool_selection = on_tool_selection
         self._on_tool_observation = on_tool_observation
         self._on_planning = on_planning
+        self._recover_guidance = recover_guidance
 
     @hook_config(can_jump_to=["model", "end"])
     def after_model(
@@ -299,70 +314,76 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         if self._on_tool_selection is not None:
             patch = self._on_tool_selection(pending, messages)
             if patch:
-                guard_recover_applied = True
-                regenerate_instruction = str(patch.get("guard_regenerate_instruction") or "")
                 if patch.get("messages"):
                     message_deltas.extend(patch["messages"])
-                updates.update(
-                    {
-                        key: value
-                        for key, value in patch.items()
-                        if key not in ("guard_regenerate_instruction", "messages")
-                    }
-                )
-                projected_messages = apply_message_deltas(messages, message_deltas)
-                recovered_pending = extract_pending_tool_selection(projected_messages)
-                if recovered_pending:
-                    pending = recovered_pending
-                    updates["last_tool_selection"] = pending
+                if _guard_patch_is_halt(patch):
+                    _merge_guard_patch(updates, patch)
+                    pending = []
+                    updates["last_tool_selection"] = []
                 else:
-                    pending, _, continuation_deltas = (
-                        apply_tool_selection_recover_continuation(
-                            projected_messages,
-                            regenerate_instruction=regenerate_instruction,
-                        )
+                    guard_recover_applied = True
+                    regenerate_instruction = str(
+                        patch.get("guard_regenerate_instruction") or ""
                     )
-                    message_deltas.extend(continuation_deltas)
-                    updates["last_tool_selection"] = pending
+                    _merge_guard_patch(updates, patch)
+                    projected_messages = apply_message_deltas(messages, message_deltas)
+                    recovered_pending = extract_pending_tool_selection(projected_messages)
+                    if recovered_pending:
+                        pending = recovered_pending
+                        updates["last_tool_selection"] = pending
+                    else:
+                        pending, _, continuation_deltas = (
+                            apply_tool_selection_recover_continuation(
+                                projected_messages,
+                                regenerate_instruction=regenerate_instruction,
+                                inject_guidance=self._recover_guidance,
+                            )
+                        )
+                        message_deltas.extend(continuation_deltas)
+                        updates["last_tool_selection"] = pending
 
         # Recover cleared all pending tool calls — never enter ToolNode this step.
         if guard_recover_applied and not pending:
             updates["jump_to"] = "model"
 
-        _apply_guard_incident_halt(updates)
-
         # planning: write_todos tool call args contain the natural-language plan todos
-        if self._on_planning is not None:
+        if self._on_planning is not None and not updates.get("guard_incident_halt"):
             for call in pending:
                 if call.get("name") == WRITE_TODOS_TOOL_NAME:
                     todos = (call.get("args") or {}).get("todos")
                     if todos is not None:
                         plan_patch = self._on_planning(todos, messages)
                         if plan_patch:
-                            planning_regenerate = str(
-                                plan_patch.get("guard_regenerate_instruction") or ""
-                            )
                             if plan_patch.get("messages"):
                                 message_deltas.extend(plan_patch["messages"])
-                            updates["guard_planning_recover_pending"] = True
-                            updates["guard_planning_recover_notice"] = planning_regenerate
-                            updates.update(
-                                {
-                                    key: value
-                                    for key, value in plan_patch.items()
-                                    if key
-                                    not in (
-                                        "guard_regenerate_instruction",
-                                        "messages",
+                            if _guard_patch_is_halt(plan_patch):
+                                _merge_guard_patch(updates, plan_patch)
+                                pending = []
+                                updates["last_tool_selection"] = []
+                            else:
+                                _merge_guard_patch(updates, plan_patch)
+                                if self._recover_guidance:
+                                    planning_regenerate = str(
+                                        plan_patch.get("guard_regenerate_instruction")
+                                        or ""
                                     )
-                                }
-                            )
-                            projected_messages = apply_message_deltas(
-                                messages, message_deltas
-                            )
-                            pending = extract_pending_tool_selection(projected_messages)
-                            updates["last_tool_selection"] = pending
+                                    updates["guard_planning_recover_pending"] = True
+                                    updates["guard_planning_recover_notice"] = (
+                                        planning_regenerate
+                                    )
+                                projected_messages = apply_message_deltas(
+                                    messages, message_deltas
+                                )
+                                pending = extract_pending_tool_selection(
+                                    projected_messages
+                                )
+                                updates["last_tool_selection"] = pending
                     break
+
+        if updates.get("guard_incident_halt"):
+            pending = []
+            updates["last_tool_selection"] = []
+        _apply_guard_incident_halt(updates)
 
         if message_deltas:
             updates["messages"] = message_deltas
@@ -433,12 +454,14 @@ def create_stage_capture_middleware(
     on_tool_selection: OnToolSelectionCallback | None = None,
     on_tool_observation: OnToolObservationCallback | None = None,
     on_planning: OnPlanningCallback | None = None,
+    recover_guidance: bool = True,
 ) -> MainStageCaptureMiddleware:
     return MainStageCaptureMiddleware(
         debug=debug,
         on_tool_selection=on_tool_selection,
         on_tool_observation=on_tool_observation,
         on_planning=on_planning,
+        recover_guidance=recover_guidance,
     )
 
 

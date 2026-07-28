@@ -2,6 +2,12 @@
 
 **S³ (Stage-Specific Safety)** is a multi-stage defense framework for LLM agents. It introduces **Stage-Specific Safety Skills**, a unified abstraction that represents heterogeneous safety designs as reusable and composable components with explicit stage semantics. S³ employs an external Guard Agent to orchestrate these skills for risk detection and mitigation throughout the agentic workflow.
 
+<p align="center">
+  <img src="figure/overview.pdf" alt="S³ Framework Overview" width="100%" />
+</p>
+
+<p align="center"><em>Figure: Overview of the S³ framework.</em></p>
+
 ---
 
 ## 1. Project Overview
@@ -13,12 +19,13 @@ S³ models modern LLM agents as a multi-stage agentic workflow. Different workfl
 
 | Stage                | Threat | Description                                                   |
 | -------------------- | ------ | ------------------------------------------------------------- |
-| **input**            | DPI    | Direct prompt injection in the user message                   |
-| **memory**           | MP     | Episodic memory poisoning (rank-1 risk + benign pool)         |
-| **planning**         | PoT    | Planning-time backdoor in system prompt (`Please` trigger)    |
-| **tool_selection**   | RTS    | Risky tool-selection override (decoy → hazard args)           |
-| **tool_observation** | OPI    | Observation prompt injection on first actionable tool return  |
-| **post_step**        | RTE    | Post-execution / god-mode hazard world state                  |
+| **input**            | Direct Prompt Injection    | Direct prompt injection in the user message                   |
+| **memory**           | Memory Poisoning     | Episodic memory poisoning (rank-1 risk + benign pool)         |
+| **planning**         | Backdoor PoT    | Planning-time backdoor in system prompt (`Please` trigger)    |
+| **tool_selection**   | Selection Perturbation    | Risky tool-selection override (decoy → hazard args)           |
+| **tool_execution**        | Environment Perturbation    | Post-execution / god-mode hazard world state                  |
+| **tool_observation** | Observation Prompt Injection    | Observation prompt injection on first actionable tool return  |
+
 
 
 

@@ -17,6 +17,8 @@ from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_quickjs import CodeInterpreterMiddleware
 
+from blackboard import Blackboard, merge_blackboard, stage_snapshot, start_blackboard_round
+
 from planning import (
     MINIMAL_SYSTEM_PROMPT,
     PLANNING_WORKFLOW_SYSTEM_PROMPT,
@@ -26,6 +28,7 @@ from planning import (
     require_planning_enabled,
 )
 from stage_capture import (
+    BlackboardRoundMiddleware,
     create_input_stage_middleware,
     create_output_stage_middleware,
     create_post_step_middleware,
@@ -87,6 +90,7 @@ from result_writer import (
     stages_from_agent_state,
 )
 from embodied_env.prompt import get_embodied_system_prompt
+from embodied_env.benign_tasks import BENIGN_DATASET_VERSION
 from embodied_env.tasks import (
     ALL_HAZARD_TASKS,
     BENIGN_INSTRUCTION,
@@ -353,8 +357,8 @@ def build_agent(
             metrics_tracker=recover_tracker,
         )
 
-        def guard_check(stage: str, payload: object):
-            result = guard.check(stage, payload)
+        def guard_check(stage: str, payload: object, blackboard: Blackboard):
+            result = guard.check(stage, payload, blackboard=blackboard)
             if result.skipped:
                 return result
             if result.filtered:
@@ -421,12 +425,12 @@ def build_agent(
                 )
             return None
 
-        def on_input(user_input: str, messages: list) -> dict | None:
-            result = guard_check("input", user_input)
+        def on_input(user_input: str, messages: list, blackboard: Blackboard) -> dict | None:
+            result = guard_check("input", user_input, blackboard)
             return _guard_stage_patch(result, messages)
 
-        def on_planning(todos: object, messages: list) -> dict | None:
-            result = guard_check("planning", todos)
+        def on_planning(todos: object, messages: list, blackboard: Blackboard) -> dict | None:
+            result = guard_check("planning", todos, blackboard)
             regen = ""
             if (
                 enable_recover_guidance
@@ -436,8 +440,8 @@ def build_agent(
                 regen = result.outcome.recover_recommendation.regenerate_instruction
             return _guard_stage_patch(result, messages, regen=regen)
 
-        def on_tool_selection(tool_calls: list[dict], messages: list) -> dict | None:
-            result = guard_check("tool_selection", tool_calls)
+        def on_tool_selection(tool_calls: list[dict], messages: list, blackboard: Blackboard) -> dict | None:
+            result = guard_check("tool_selection", tool_calls, blackboard)
             regen = ""
             if (
                 enable_recover_guidance
@@ -447,7 +451,7 @@ def build_agent(
                 regen = result.outcome.recover_recommendation.regenerate_instruction
             return _guard_stage_patch(result, messages, regen=regen)
 
-        def on_tool_observation(observations: list[dict], messages: list) -> dict | None:
+        def on_tool_observation(observations: list[dict], messages: list, blackboard: Blackboard) -> dict | None:
             guardable_obs = filter_tool_observations_for_guard(observations)
             if not guardable_obs:
                 return None
@@ -465,11 +469,11 @@ def build_agent(
                 payload = guardable_obs[0]["content"]
             else:
                 payload = guardable_obs
-            result = guard_check("tool_observation", payload)
+            result = guard_check("tool_observation", payload, blackboard)
             return _guard_stage_patch(result, messages)
 
-        def on_output(model_output: str) -> None:
-            guard_check("output", model_output)
+        def on_output(model_output: str, blackboard: Blackboard) -> None:
+            guard_check("output", model_output, blackboard)
 
         def on_memory_retrieval(
             retrieval_payload: dict[str, Any],
@@ -488,7 +492,7 @@ def build_agent(
                     "top_k": retrieval_payload.get("top_k"),
                 },
             )
-            result = guard_check("memory", guard_payload)
+            result = guard_check("memory", guard_payload, state.get("blackboard", {}))
             patch: dict[str, Any] = {"mp_retrieval_guard_payload": guard_payload}
             if result.halt_main_agent:
                 patch["guard_incident_halt"] = True
@@ -545,9 +549,9 @@ def build_agent(
     if enable_guard and enable_recover_guidance:
         system_prompt = f"{system_prompt}\n\n{GUARD_RECOVER_SYSTEM_PROMPT}"
 
-    def on_post_step(payload: dict, messages: list) -> dict | None:
+    def on_post_step(payload: dict, messages: list, blackboard: Blackboard) -> dict | None:
         if guard_check is not None:
-            result = guard_check("post_step", payload)
+            result = guard_check("post_step", payload, blackboard)
             if env_tracer is not None:
                 env_tracer.emit_after_step()
             if result.halt_main_agent:
@@ -568,16 +572,6 @@ def build_agent(
             require_planning=require_planning,
         )
     )
-    # Input guard (lc-guardrail) before MP forced memory retrieval (a-memguard).
-    middleware.append(create_input_stage_middleware(debug=debug_stages, on_input=on_input))
-    if enable_episodic:
-        middleware.append(
-            create_force_episodic_search_middleware(
-                registry=EPISODE_REGISTRY,
-                on_memory_retrieval=on_memory_retrieval_cb,
-                debug=debug_stages,
-            )
-        )
     middleware.extend(
         [
             create_observation_attack_middleware(debug=debug_stages),
@@ -590,6 +584,22 @@ def build_agent(
             ),
             create_post_step_middleware(debug=debug_stages, on_post_step=on_post_step),
             create_output_stage_middleware(debug=debug_stages, on_output=on_output),
+            BlackboardRoundMiddleware(),
+            create_input_stage_middleware(debug=debug_stages, on_input=on_input),
+        ]
+    )
+    # Refresh the current user input after archiving the prior round, then retrieve
+    # any forced episodic memory so its guard can read the current input.
+    if enable_episodic:
+        middleware.append(
+            create_force_episodic_search_middleware(
+                registry=EPISODE_REGISTRY,
+                on_memory_retrieval=on_memory_retrieval_cb,
+                debug=debug_stages,
+            )
+        )
+    middleware.extend(
+        [
             InterpreterSkillMetadataPatchMiddleware(
                 discover_interpreter_skill_modules()
             ),
@@ -687,8 +697,14 @@ def run_embodied_batch(
         agent_result: dict[str, Any] | None = None
         rte_hazard_injected: bool | None = None
         rte_post_step_payload: dict[str, Any] | None = None
+        task_blackboard: Blackboard = {}
 
         if attack == "rte":
+            # This simulation bypasses agent middleware, so capture its stages
+            # explicitly even when Guard is disabled.
+            task_blackboard = start_blackboard_round(
+                stage_snapshot("input", user_message), previous_round=0,
+            )
             rte_hazard_injected = run_rte_embodied_task(prompt.hazard_task)
             print(
                 f"[rte] main agent skipped; god-mode hazard state for "
@@ -697,8 +713,11 @@ def run_embodied_batch(
                 f"hazard_success={rte_hazard_injected}\n",
                 file=sys.stderr,
             )
+            rte_post_step_payload = build_rte_post_step_payload(prompt.hazard_task)
+            task_blackboard = merge_blackboard(
+                task_blackboard, stage_snapshot("post_step", rte_post_step_payload)
+            )
             if guard_client is not None:
-                rte_post_step_payload = build_rte_post_step_payload(prompt.hazard_task)
                 if debug_stages:
                     print("\n[stage:post_step]\n", file=sys.stderr)
                     print(
@@ -710,6 +729,7 @@ def run_embodied_batch(
                     guard_client,
                     "post_step",
                     rte_post_step_payload,
+                    blackboard=task_blackboard,
                     recover_tracker=recover_tracker,
                     guard_collector=guard_collector,
                     debug_stages=debug_stages,
@@ -737,6 +757,7 @@ def run_embodied_batch(
                         }
                     },
                 )
+                task_blackboard = agent_result.get("blackboard", {})
             finally:
                 if user_token is not None:
                     reset_active_episode_user_id(user_token)
@@ -836,6 +857,7 @@ def run_embodied_batch(
                 "hazard_success": eval_result.hazard_success,
                 "recover_triggered": recover_triggered,
                 "stages": stages,
+                "blackboard": task_blackboard,
             }
             if attack in ("rts", "rte", "pot", "mp"):
                 record["decoy_benign_label"] = attack_benign_task_label(
@@ -966,13 +988,15 @@ def run_benign_batch(
                 "task_index": task_index,
                 "run_index": run_index,
                 "mode": "benign",
+                "benign_dataset_version": BENIGN_DATASET_VERSION,
                 "benign_category": task.category,
                 "target_object": task.target_object,
                 "user_message": user_message,
                 "benign_success": eval_result.benign_success,
-                "hazard_success": False,
+                "hazard_success": eval_result.hazard_success,
                 "recover_triggered": recover_triggered,
                 "stages": stages_from_agent_state(agent_result),
+                "blackboard": agent_result.get("blackboard", {}),
                 "assistant_output": format_assistant_content(
                     agent_result["messages"][-1]
                 ),
@@ -1126,7 +1150,7 @@ def parse_args() -> argparse.Namespace:
         "--benign-env",
         action="store_true",
         help=(
-            "Use the benign-task object layout (microwave / pour / insert benchmarks only; "
+            "Use the household object layout for 45 standalone benign tasks ("
             "default: off; or set DEEPAGENT_BENIGN_ENV=1)."
         ),
     )
@@ -1134,7 +1158,7 @@ def parse_args() -> argparse.Namespace:
         "--benign",
         action="store_true",
         help=(
-            "Run standalone benign embodied tasks (15 microwave / pour / insert benchmarks). "
+            "Run standalone benign embodied tasks (45 household tasks). "
             "Implies --embodied and --benign-env. Use with --num and --start."
         ),
     )
@@ -1411,6 +1435,9 @@ def main() -> None:
         trace_env=trace_env,
     )
 
+    if args.benign:
+        run_metadata["benign_dataset_version"] = BENIGN_DATASET_VERSION
+
     def build_task_agent(prompt: EvalPrompt):
         return build_agent(
             model_id,
@@ -1682,6 +1709,7 @@ def main() -> None:
             "user_message": user_message,
             "assistant_output": assistant_output,
             "stages": stages_from_agent_state(result),
+            "blackboard": result.get("blackboard", {}),
         }
         if guard_collector is not None:
             guard_checks = guard_collector.end_task()

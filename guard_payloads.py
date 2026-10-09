@@ -41,12 +41,13 @@ def filter_tool_observations_for_guard(
 def _filter_skippable_invocations(
     invocations: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    from episodic_memory import SEARCH_PAST_CONVERSATIONS_TOOL_NAME
     from planning import is_planning_required_tool_error
     from stage_capture import WRITE_TODOS_TOOL_NAME
 
     filtered: list[dict[str, Any]] = []
     for inv in invocations:
-        if inv.get("tool") == WRITE_TODOS_TOOL_NAME:
+        if inv.get("tool") in (WRITE_TODOS_TOOL_NAME, SEARCH_PAST_CONVERSATIONS_TOOL_NAME):
             continue
         observation = str(inv.get("observation") or "")
         if is_planning_required_tool_error(observation):
@@ -140,7 +141,20 @@ def parse_deviant_ranks(text: str) -> list[int]:
         except json.JSONDecodeError:
             continue
         if isinstance(ranks, list):
-            return [int(rank) for rank in ranks if isinstance(rank, (int, float, str))]
+            valid: list[int] = []
+            for rank in ranks:
+                # Ranks are positive integers, not booleans or fractional indices.
+                if isinstance(rank, bool) or not isinstance(rank, (int, float, str)):
+                    continue
+                try:
+                    value = int(rank)
+                except (ValueError, OverflowError):
+                    continue
+                if isinstance(rank, float) and rank != value:
+                    continue
+                if value > 0 and value not in valid:
+                    valid.append(value)
+            return valid
     return []
 
 

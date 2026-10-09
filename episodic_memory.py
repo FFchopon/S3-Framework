@@ -11,6 +11,8 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, Mod
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
+from blackboard import merge_blackboard, stage_snapshot
+
 from episode_store import (
     EPISODE_REGISTRY,
     EpisodeRegistry,
@@ -297,11 +299,18 @@ class ForceEpisodicSearchMiddleware(AgentMiddleware[StageCaptureState, Any, Any]
             ensure_ascii=False,
         )
 
-        updates: dict[str, Any] = {"mp_retrieval_done": True}
+        updates: dict[str, Any] = {
+            "mp_retrieval_done": True,
+            "blackboard": stage_snapshot(STAGE_MEMORY, agent_retrieval_event),
+        }
         if self._on_memory_retrieval is not None:
             messages = list(state.get("messages") or [])
             patch = self._on_memory_retrieval(
-                guard_retrieval_payload, messages, dict(state)
+                guard_retrieval_payload, messages,
+                {
+                    **dict(state),
+                    "blackboard": merge_blackboard(state.get("blackboard"), updates["blackboard"]),
+                },
             )
             if patch:
                 updates.update(patch)

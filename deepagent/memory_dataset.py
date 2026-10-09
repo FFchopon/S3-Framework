@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from .embodied_env.tasks import (
+from embodied_env.tasks import (
     BENIGN_TASKS_BY_CATEGORY,
     MP_BENIGN_MEMORY_COUNT,
     PromptStyle,

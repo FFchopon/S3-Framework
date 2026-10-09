@@ -1,6 +1,7 @@
 """Capture Main Agent stage payloads for GuardAgent integration.
 
-- before_model (input): latest user input before a model call
+- before_agent (input): bind external user input at invocation entry
+- before_model (input): refresh the bound input before a model call
 - after_model (tool selection): pending tool_calls before ToolNode runs
 - before_model (tool observation): ToolMessage results before the next model call
 - before_model (post step): after a completed tool loop, before the next model call
@@ -12,7 +13,9 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
-from typing import Any, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
+
+from blackboard import Blackboard, merge_blackboard, stage_snapshot, start_blackboard_round
 
 from guard_recover import (
     apply_message_deltas,
@@ -21,6 +24,8 @@ from guard_recover import (
 )
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, hook_config
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from langgraph.types import Overwrite
+from message_provenance import guard_notice_message, is_external_user_message
 
 STAGE_DEBUG_ENV = "DEEPAGENT_DEBUG_STAGES"
 
@@ -57,14 +62,25 @@ class StageEvent(TypedDict):
     invocations: NotRequired[list[dict[str, Any]]]
 
 
+class UserInputBinding(TypedDict):
+    source: Literal["user"]
+    message_id: str
+    version: int
+    content: str
+
+
 class StageCaptureState(AgentState):
     """Extended agent state for stage-aware guard hooks."""
 
     last_user_input: NotRequired[str]
+    user_input_binding: NotRequired[UserInputBinding]
+    seen_user_input_ids: NotRequired[list[str]]
     last_model_output: NotRequired[str]
     last_tool_selection: NotRequired[list[ToolCallPlan]]
     last_tool_observations: NotRequired[list[ToolObservationRecord]]
     stage_events: NotRequired[list[StageEvent]]
+    blackboard: NotRequired[Annotated[Blackboard, merge_blackboard]]
+    blackboard_round: NotRequired[int]
     guard_checks: NotRequired[dict[str, Any]]
     guard_incident_halt: NotRequired[bool]
     attack_type: NotRequired[str]
@@ -117,13 +133,13 @@ def _last_ai_message(messages: list[AnyMessage]) -> AIMessage | None:
 
 def _last_human_message(messages: list[AnyMessage]) -> HumanMessage | None:
     for message in reversed(messages):
-        if isinstance(message, HumanMessage):
+        if is_external_user_message(message):
             return message
     return None
 
 
 def extract_latest_user_input(messages: list[AnyMessage]) -> str | None:
-    """Latest user input text before a model call."""
+    """Latest external user input text; runtime refresh uses the bound snapshot."""
     last_human = _last_human_message(messages)
     if last_human is None:
         return None
@@ -237,11 +253,11 @@ def is_completed_tool_step(messages: list[AnyMessage]) -> bool:
 
 
 StageStateUpdate = dict[str, Any] | None
-OnToolSelectionCallback = Callable[[list[ToolCallPlan], list[AnyMessage]], StageStateUpdate]
-OnToolObservationCallback = Callable[[list[ToolObservationRecord], list[AnyMessage]], StageStateUpdate]
-OnInputCallback = Callable[[str, list[AnyMessage]], StageStateUpdate]
-OnOutputCallback = Callable[[str], None]
-OnPlanningCallback = Callable[[Any, list[AnyMessage]], StageStateUpdate]
+OnToolSelectionCallback = Callable[[list[ToolCallPlan], list[AnyMessage], Blackboard], StageStateUpdate]
+OnToolObservationCallback = Callable[[list[ToolObservationRecord], list[AnyMessage], Blackboard], StageStateUpdate]
+OnInputCallback = Callable[[str, list[AnyMessage], Blackboard], StageStateUpdate]
+OnOutputCallback = Callable[[str, Blackboard], None]
+OnPlanningCallback = Callable[[Any, list[AnyMessage], Blackboard], StageStateUpdate]
 
 
 def _apply_guard_incident_halt(updates: dict[str, Any]) -> None:
@@ -298,10 +314,11 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         )
 
         if self._debug:
-            emit_stage_debug(STAGE_TOOL_SELECTION, pending)
+            emit_stage_debug(STAGE_TOOL_SELECTION, stage_snapshot(STAGE_TOOL_SELECTION, pending)[STAGE_TOOL_SELECTION])
 
         updates: dict[str, Any] = {
             "last_tool_selection": pending,
+            "blackboard": stage_snapshot(STAGE_TOOL_SELECTION, pending),
             **rts_updates,
         }
         prior = list(state.get("stage_events") or [])
@@ -312,7 +329,10 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         guard_recover_applied = False
         message_deltas: list[AnyMessage] = []
         if self._on_tool_selection is not None:
-            patch = self._on_tool_selection(pending, messages)
+            patch = self._on_tool_selection(
+                pending, messages,
+                merge_blackboard(state.get("blackboard"), updates["blackboard"]),
+            )
             if patch:
                 if patch.get("messages"):
                     message_deltas.extend(patch["messages"])
@@ -347,12 +367,22 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             updates["jump_to"] = "model"
 
         # planning: write_todos tool call args contain the natural-language plan todos
-        if self._on_planning is not None and not updates.get("guard_incident_halt"):
+        if not updates.get("guard_incident_halt"):
             for call in pending:
                 if call.get("name") == WRITE_TODOS_TOOL_NAME:
                     todos = (call.get("args") or {}).get("todos")
                     if todos is not None:
-                        plan_patch = self._on_planning(todos, messages)
+                        updates["blackboard"].update(
+                            stage_snapshot(STAGE_PLANNING, todos)
+                        )
+                        plan_patch = (
+                            self._on_planning(
+                                todos, messages,
+                                merge_blackboard(state.get("blackboard"), updates["blackboard"]),
+                            )
+                            if self._on_planning is not None
+                            else None
+                        )
                         if plan_patch:
                             if plan_patch.get("messages"):
                                 message_deltas.extend(plan_patch["messages"])
@@ -390,7 +420,7 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
 
         event: StageEvent = {
             "stage": STAGE_TOOL_SELECTION,
-            "tool_calls": pending,
+            "tool_calls": stage_snapshot(STAGE_TOOL_SELECTION, pending)[STAGE_TOOL_SELECTION],
         }
         updates["stage_events"] = [*prior, event]
         return updates
@@ -415,7 +445,7 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
                         state.get("guard_planning_recover_notice") or ""
                     )
                 )
-                updates["messages"] = [HumanMessage(content=notice)]
+                updates["messages"] = [guard_notice_message(notice)]
                 updates["guard_planning_recover_pending"] = False
 
         observations = extract_latest_tool_observations(messages)
@@ -427,8 +457,50 @@ class MainStageCaptureMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
                 emit_stage_debug(STAGE_TOOL_OBSERVATION, observations)
 
             updates["last_tool_observations"] = observations
+            invocations = extract_last_step_invocations(messages)
+            observation_texts = [record["content"] for record in observations]
+            updates["blackboard"] = stage_snapshot(
+                STAGE_TOOL_OBSERVATION,
+                {"observation": observation_texts[0] if len(observation_texts) == 1
+                 else observation_texts},
+            )
+            # Ordinary episodic searches also enter the memory stage; the MP
+            # forced-search middleware captures its own pre-recovery snapshot.
+            from episodic_memory import SEARCH_PAST_CONVERSATIONS_TOOL_NAME, STAGE_MEMORY
+
+            # The forced search is a synthetic one-call round, already captured
+            # in ForceEpisodicSearchMiddleware before any recovery.
+            last_ai = _last_ai_message(messages)
+            forced_search = bool(
+                state.get("mp_retrieval_done")
+                and last_ai
+                and len(last_ai.tool_calls) == 1
+                and str(last_ai.tool_calls[0].get("id", "")).startswith("mp_search_")
+            )
+
+            for invocation in invocations:
+                if invocation["tool"] != SEARCH_PAST_CONVERSATIONS_TOOL_NAME:
+                    continue
+                if forced_search:
+                    continue
+                try:
+                    retrieval = json.loads(invocation["observation"])
+                except (TypeError, json.JSONDecodeError):
+                    retrieval = None
+                if not isinstance(retrieval, dict):
+                    retrieval = {
+                        **invocation["args"],
+                        "observation": invocation["observation"],
+                    }
+                updates["blackboard"].update(stage_snapshot(
+                    STAGE_MEMORY,
+                    {**retrieval, "retrieval_tool": SEARCH_PAST_CONVERSATIONS_TOOL_NAME},
+                ))
             if self._on_tool_observation is not None:
-                patch = self._on_tool_observation(observations, messages)
+                patch = self._on_tool_observation(
+                    observations, messages,
+                    merge_blackboard(state.get("blackboard"), updates["blackboard"]),
+                )
                 if patch:
                     updates.update(patch)
 
@@ -466,7 +538,7 @@ def create_stage_capture_middleware(
 
 
 class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
-    """Capture latest user input before each model call."""
+    """Bind user input once at invocation entry, then refresh it each round."""
 
     state_schema = StageCaptureState
 
@@ -474,25 +546,76 @@ class InputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         self._debug = debug
         self._on_input = on_input
 
+    def before_agent(
+        self, state: StageCaptureState, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        # This hook runs once at graph entry, before internal tool/recovery loops.
+        # The messages reducer assigns IDs before this hook. Seen IDs also stop
+        # sanitized/replayed history from being mistaken for a new user request.
+        seen = list(state.get("seen_user_input_ids") or [])
+        seen_ids = set(seen)
+        prior = state.get("user_input_binding")
+        candidate = None
+        for message in state.get("messages") or []:
+            if not is_external_user_message(message):
+                continue
+            if not message.id:
+                raise ValueError("User input binding requires a message ID at graph entry.")
+            if message.id in seen_ids:
+                # A real caller may edit the current user message in place.
+                # Guard-sanitized copies carry internal origin and are excluded.
+                if (prior and message.id == prior["message_id"]
+                        and _tool_message_content(message.content) != prior["content"]):
+                    candidate = message
+                continue
+            seen.append(message.id)
+            seen_ids.add(message.id)
+            candidate = message
+        if candidate is None:
+            return None
+        updates: dict[str, Any] = {"seen_user_input_ids": seen}
+        content = _tool_message_content(candidate.content)
+        updates["user_input_binding"] = {
+            "source": "user",
+            "message_id": candidate.id,
+            "version": (prior["version"] if prior else 0) + 1,
+            "content": content,
+        }
+        return updates
+
+    async def abefore_agent(
+        self, state: StageCaptureState, runtime: Any  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        return self.before_agent(state, runtime)
+
     @hook_config(can_jump_to=["end"])
     def before_model(
         self, state: StageCaptureState, runtime: Any  # noqa: ARG002
     ) -> dict[str, Any] | None:
         messages = state.get("messages") or []
-        user_input = extract_latest_user_input(messages)
+        binding = state.get("user_input_binding")
+        user_input = binding["content"] if binding else None
+        # Do not rescan model-facing messages: recovery notices and sanitized
+        # copies cannot replace the request captured at the invocation boundary.
         if not user_input:
             return None
         if state.get("last_user_input") == user_input:
-            return None
+            # The round middleware archives prior snapshots before this hook.
+            # Refresh the goal without repeating input checks or stage events.
+            return {"blackboard": stage_snapshot(STAGE_INPUT, user_input)}
 
         if self._debug:
             emit_stage_debug(STAGE_INPUT, {"user_input": user_input})
 
         updates: dict[str, Any] = {
             "last_user_input": user_input,
+            "blackboard": stage_snapshot(STAGE_INPUT, user_input),
         }
         if self._on_input is not None:
-            patch = self._on_input(user_input, messages)
+            patch = self._on_input(
+                user_input, messages,
+                merge_blackboard(state.get("blackboard"), updates["blackboard"]),
+            )
             if patch:
                 updates.update(patch)
 
@@ -517,7 +640,7 @@ def create_input_stage_middleware(
     return InputStageMiddleware(debug=debug, on_input=on_input)
 
 
-OnPostStepCallback = Callable[[dict[str, Any], list[AnyMessage]], StageStateUpdate]
+OnPostStepCallback = Callable[[dict[str, Any], list[AnyMessage], Blackboard], StageStateUpdate]
 
 
 class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
@@ -548,9 +671,14 @@ class PostStepStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             emit_post_step_marker()
             emit_stage_debug(STAGE_POST_STEP, payload)
 
-        updates: dict[str, Any] = {}
+        updates: dict[str, Any] = {
+            "blackboard": stage_snapshot(STAGE_POST_STEP, payload),
+        }
         if self._on_post_step is not None:
-            patch = self._on_post_step(payload, messages)
+            patch = self._on_post_step(
+                payload, messages,
+                merge_blackboard(state.get("blackboard"), updates["blackboard"]),
+            )
             if patch:
                 updates.update(patch)
 
@@ -602,7 +730,10 @@ class OutputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
             emit_stage_debug(STAGE_OUTPUT, {"model_output": model_output})
 
         if self._on_output is not None:
-            self._on_output(model_output)
+            self._on_output(
+                model_output,
+                merge_blackboard(state.get("blackboard"), stage_snapshot(STAGE_OUTPUT, model_output)),
+            )
 
         event: StageEvent = {
             "stage": STAGE_OUTPUT,
@@ -611,6 +742,7 @@ class OutputStageMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
         prior = list(state.get("stage_events") or [])
         return {
             "last_model_output": model_output,
+            "blackboard": stage_snapshot(STAGE_OUTPUT, model_output),
             "stage_events": [*prior, event],
         }
 
@@ -624,3 +756,28 @@ def create_output_stage_middleware(
     *, debug: bool = False, on_output: OnOutputCallback | None = None
 ) -> OutputStageMiddleware:
     return OutputStageMiddleware(debug=debug, on_output=on_output)
+
+
+class BlackboardRoundMiddleware(AgentMiddleware[StageCaptureState, Any, Any]):
+    """Start the next round after observation/post_step hooks, before the model.
+
+    Register after previous-step capture hooks and before input and forced memory
+    retrieval. Archive the completed round, retain the previous two rounds, then
+    refresh input for the current round.
+    A recovery jump also starts a fresh round, even without tool execution.
+    """
+
+    state_schema = StageCaptureState
+
+    def before_model(self, state: StageCaptureState, runtime: Any) -> dict[str, Any]:
+        previous_round = state.get("blackboard_round", 0)
+        # Ordinary merging would leak older stage keys into the new round.
+        return {
+            "blackboard_round": previous_round + 1,
+            "blackboard": Overwrite(start_blackboard_round(
+                state.get("blackboard"), previous_round=previous_round,
+            )),
+        }
+
+    async def abefore_model(self, state: StageCaptureState, runtime: Any) -> dict[str, Any]:
+        return self.before_model(state, runtime)

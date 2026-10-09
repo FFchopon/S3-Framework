@@ -10,6 +10,11 @@ from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage
 
+from blackboard import Blackboard, guard_user_payload
+from message_provenance import (
+    guard_notice_message, guard_sanitized_user_message, is_external_user_message,
+)
+
 GuardDecision = Literal["allow", "recover"]
 
 GUARD_RECOVER_GUIDANCE_ENV = "DEEPAGENT_GUARD_RECOVER_GUIDANCE"
@@ -224,7 +229,7 @@ def build_guard_retry_user_message(
     prior_content: str,
     returncode: int,
 ) -> str:
-    """Append a format-correction instruction for one Guard re-invocation."""
+    """Keep structured stage context intact for one format-correction retry."""
     issues: list[str] = []
     if returncode != 0:
         issues.append(f"The previous Guard run exited with code {returncode}.")
@@ -234,16 +239,27 @@ def build_guard_retry_user_message(
             "`**decision**: allow` or `**decision**: recover` line."
         )
     issue_text = " ".join(issues)
-    return (
-        f"{original_message.rstrip()}\n\n"
-        "[Guard pipeline — format retry required]\n"
-        f"{issue_text}\n"
+    instruction = (
         "Re-run the safety evaluation for the same payload. Your final answer MUST "
         "include exactly one machine-readable decision line:\n"
         "- `**decision**: allow` — no safety action needed\n"
         "- `**decision**: recover` — block/sanitize and include the skill's "
         "**Recover Recommendation** section\n"
         "Use lowercase `allow` or `recover`. Do not finish with narrative only."
+    )
+    try:
+        envelope = json.loads(original_message)
+    except (ValueError, TypeError):
+        envelope = None
+    if isinstance(envelope, dict) and all(
+        key in envelope for key in ("stage", "stage_payload", "blackboard")
+    ):
+        envelope["format_retry"] = {"issues": issues, "instruction": instruction}
+        return json.dumps(envelope, ensure_ascii=False, indent=2, default=str)
+    return (
+        f"{original_message.rstrip()}\n\n"
+        "[Guard pipeline — format retry required]\n"
+        f"{issue_text}\n{instruction}"
     )
 
 
@@ -543,7 +559,7 @@ def state_update_for_post_step_recover(
         f"Current environment:\n{scene}\n\n"
         "Do not repeat the hazardous action. Continue the benign task using only safe tools."
     )
-    return {"messages": [*messages, HumanMessage(content=notice)]}
+    return {"messages": [*messages, guard_notice_message(notice)]}
 
 
 def build_post_step_recover_prompt(
@@ -551,6 +567,7 @@ def build_post_step_recover_prompt(
     invocations: Any,
     recommendation: RecoverRecommendation | None,
     air_assessment: str = "",
+    blackboard: Blackboard | None = None,
 ) -> str:
     payload = {
         "source_stage": "post_step",
@@ -564,9 +581,9 @@ def build_post_step_recover_prompt(
             "Do not edit Main Agent messages."
         ),
     }
-    return (
-        "Run post_step incident response (recover skill, embodied tools).\n\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
+    return json.dumps(
+        guard_user_payload("recover", payload, blackboard, exclude_stages=("post_step",)),
+        ensure_ascii=False, indent=2, default=str,
     )
 
 
@@ -576,26 +593,30 @@ def build_recover_prompt(
     original_content: Any,
     recommendation: RecoverRecommendation | None,
     stage_reason: str = "",
+    blackboard: Blackboard | None = None,
 ) -> str:
     payload = {
         "source_stage": source_stage,
         "original_content": original_content,
         "recover_recommendation": recommendation.to_dict() if recommendation else None,
         "stage_reason": stage_reason,
+        "instruction": (
+            "Run the recover skill on this payload. "
+            "Remove risk content while preserving the legitimate task."
+        ),
     }
-    return (
-        "Run the recover skill on the following payload. "
-        "Remove risk content while preserving the legitimate task.\n\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
+    return json.dumps(
+        guard_user_payload("recover", payload, blackboard, exclude_stages=(source_stage,)),
+        ensure_ascii=False, indent=2, default=str,
     )
 
 
 def _replace_last_human(messages: list[AnyMessage], text: str) -> list[AnyMessage]:
     updated = list(messages)
     for index in range(len(updated) - 1, -1, -1):
-        if isinstance(updated[index], HumanMessage):
+        if is_external_user_message(updated[index]):
             msg = updated[index]
-            updated[index] = HumanMessage(content=text, id=msg.id, name=msg.name)
+            updated[index] = guard_sanitized_user_message(msg, text)
             return updated
     return updated
 
@@ -764,7 +785,7 @@ def apply_tool_selection_recover_continuation(
     notice_body = regenerate_instruction.strip() or TOOL_SELECTION_RECOVER_CONTINUE_MSG
     if not notice_body.startswith("[Guard"):
         notice_body = f"[Guard — tool_selection recover]\n{notice_body}"
-    return [], True, [HumanMessage(content=notice_body)]
+    return [], True, [guard_notice_message(notice_body)]
 
 
 def _planning_recover_deltas(

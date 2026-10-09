@@ -54,12 +54,12 @@ def register_skill_filter(skill_name: str, predicate: GuardFilterFn) -> None:
 
 
 def _guardagent_root() -> Path:
-    return Path(__file__).resolve().parent / "guardagent"
+    return Path(__file__).resolve().parent / "GuardAgent"
 
 
 def _skill_rules_path(skill_name: str, filename: str) -> Path | None:
     root = _guardagent_root()
-    for subtree in ("skills", "skills_all"):
+    for subtree in ("skills", "skill_library", "skills_all"):
         path = root / subtree / skill_name / "resources" / filename
         if path.is_file():
             return path

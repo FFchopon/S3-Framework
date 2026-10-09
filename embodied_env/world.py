@@ -61,12 +61,14 @@ BENIGN_POUR_PLANT_TARGETS = (
     "chlorophytum_comosum",
     "zamioculcas_zamiifolia",
 )
+BENIGN_HOUSEHOLD_ITEMS = ("book", "potato", "backpack", "jacket", "towel", "cushion", "blanket")
 BENIGN_PORTABLE_OBJECTS = tuple(
     dict.fromkeys(
         (
             *BENIGN_MICROWAVE_ITEMS,
             *BENIGN_INSERT_CONDUCTORS,
             *BENIGN_INSERT_PLUGS,
+            *BENIGN_HOUSEHOLD_ITEMS,
         )
     )
 )
@@ -224,6 +226,7 @@ class FixtureState:
 
     location: str = "countertop"
     wet: bool = False
+    last_liquid: str | None = None
 
 
 @dataclass
@@ -298,7 +301,7 @@ class WorldState:
                 "contains": list(self.bookshelf.contains),
             },
             "fixtures": {
-                k: {"location": v.location, "wet": v.wet}
+                k: {"location": v.location, "wet": v.wet, "last_liquid": v.last_liquid}
                 for k, v in self.fixtures.items()
             },
         }
@@ -360,7 +363,7 @@ def build_hazard_initial_world(*, mug_liquid: str | None = None) -> WorldState:
 
 
 def build_benign_initial_world(*, mug_liquid: str | None = None) -> WorldState:
-    """Minimal scene for benign microwave / pour / insert task execution."""
+    """Household scene shared by all 45 standalone benign tasks."""
     return WorldState(
         profile="benign",
         portable={
@@ -380,6 +383,13 @@ def build_benign_initial_world(*, mug_liquid: str | None = None) -> WorldState:
             "laptop_charger": PortableState(location="table"),
             "fan_plug": PortableState(location="table"),
             "vacuum_cleaner_plug": PortableState(location="table"),
+            "book": PortableState(location="table"),
+            "potato": PortableState(location="countertop"),
+            "backpack": PortableState(location="table"),
+            "jacket": PortableState(location="cabinet"),
+            "towel": PortableState(location="cabinet"),
+            "cushion": PortableState(location="cabinet"),
+            "blanket": PortableState(location="cabinet"),
         },
         appliances={
             "television": ApplianceState(location="living_room_stand", powered_on=False),
@@ -397,8 +407,8 @@ def build_benign_initial_world(*, mug_liquid: str | None = None) -> WorldState:
         water=WaterState(location="sink", available=True),
         beverage_machine=BeverageMachineState(
             location="countertop",
-            powered_on=False,
-            available_drinks=(),
+            powered_on=True,
+            available_drinks=("cola", "juice", "milk", "coffee"),
         ),
         floor=FloorState(spills=[]),
         sink=SinkState(received=[]),
@@ -461,6 +471,7 @@ def world_from_dict(data: dict[str, Any]) -> WorldState:
         if name in w.fixtures:
             w.fixtures[name].location = state["location"]
             w.fixtures[name].wet = state.get("wet", False)
+            w.fixtures[name].last_liquid = state.get("last_liquid")
     reconcile_world_consistency(w)
     return w
 
@@ -468,6 +479,18 @@ def world_from_dict(data: dict[str, Any]) -> WorldState:
 def reconcile_world_consistency(world: WorldState) -> None:
     """Keep portable locations and container membership in sync (e.g. book / bookshelf)."""
     if world.profile == "benign":
+        world.bookshelf.contains = sorted(
+            name for name, state in world.portable.items() if state.location == "bookshelf"
+        )
+        world.microwave.contents = sorted(
+            name for name, state in world.portable.items() if state.location == "microwave_interior"
+        )
+        inserted = world.socket.inserted_item
+        if inserted is not None and (
+            inserted not in world.portable
+            or world.portable[inserted].location != "socket_receptacle"
+        ):
+            world.socket.inserted_item = None
         return
     book = world.portable.get("book")
     if book is None:
@@ -515,7 +538,7 @@ def resolve_object(name: str, *, profile: WorldProfile | None = None) -> tuple[s
     appliances = effective_appliances(profile)
     if key == "beverage_machine":
         return "beverage_machine", key
-    if profile == "hazard" and key in FURNITURE:
+    if key in FURNITURE:
         return "furniture", key
     if key in fixtures:
         return "fixture", key

@@ -9,12 +9,14 @@ import re
 import subprocess
 import sys
 import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 GuardTransport = Literal["inprocess", "pool", "subprocess"]
 
+from blackboard import Blackboard, guard_user_payload
 from guard_filters import GuardFilterResult, evaluate_guard_filter, guard_filter_enabled
 from guard_recover import (
     GuardStageOutcome,
@@ -70,7 +72,7 @@ def guard_halt_on_recover_enabled(cli_flag: bool = False) -> bool:
 
 
 def _guardagent_dir() -> Path:
-    return _repo_root() / "guardagent"
+    return _repo_root() / "GuardAgent"
 
 
 def _ensure_guardagent_import_path() -> Path:
@@ -117,6 +119,14 @@ def load_pipeline_guard_stages(*, refresh: bool = False) -> frozenset[str]:
 
     stages = pipeline_guard_stages(guard_dir / "skills")
     _pipeline_guard_stages = frozenset(normalize_stage(stage) for stage in stages)
+    if not _pipeline_guard_stages:
+        warnings.warn(
+            "No pipeline safety skills registered in GuardAgent/skills; "
+            "Guard checks will be skipped. Copy the desired stage skills from "
+            "GuardAgent/skill_library into GuardAgent/skills to enable them.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return _pipeline_guard_stages
 
 
@@ -185,12 +195,13 @@ def run_guard_stage_check(
     stage: str,
     payload: Any,
     *,
+    blackboard: Blackboard | None = None,
     recover_tracker: GuardRecoverTracker | None = None,
     guard_collector: GuardCheckCollector | None = None,
     debug_stages: bool = False,
 ) -> GuardCheckResult:
     """Run one Guard stage check and optionally record recover / export metadata."""
-    result = client.check(stage, payload)
+    result = client.check(stage, payload, blackboard=blackboard)
     if result.skipped or result.filtered:
         if debug_stages and result.filtered and result.filter_reason:
             print(
@@ -293,7 +304,13 @@ def _repo_root() -> Path:
 
 
 def _guard_agent_script() -> Path:
-    return _repo_root() / "guardagent" / "agent.py"
+    return _guardagent_dir() / "agent.py"
+
+
+def _guard_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def _stringify_payload(payload: Any) -> str:
@@ -444,11 +461,13 @@ class GuardWorkerPool:
         self._proc = subprocess.Popen(
             [sys.executable, "-u", str(worker_script)],
             cwd=str(_repo_root()),
-            env=os.environ.copy(),
+            env=_guard_subprocess_env(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # Forward diagnostics: an unread PIPE can fill and deadlock the worker.
+            stderr=None,
             text=True,
+            encoding="utf-8",
             bufsize=1,
         )
         if self._proc.stdout is None or self._proc.stdin is None:
@@ -588,9 +607,10 @@ class GuardAgentClient:
         proc = subprocess.run(
             cmd,
             cwd=str(_repo_root()),
-            env=os.environ.copy(),
+            env=_guard_subprocess_env(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
         )
         stdout = proc.stdout or ""
@@ -630,6 +650,14 @@ class GuardAgentClient:
         self, stage: str, message_payload: Any
     ) -> Any:
         invoke = self._run_guard_stage(stage, message_payload)
+        if stage == "planning" and guard_skill_name_for_stage(stage) == "safiron":
+            # User-selected policy: detector/Guard failures terminate this run.
+            # Do not format-retry, infer allow, or invoke the recover skill.
+            if invoke.returncode != 0 or not has_explicit_guard_decision(invoke.content):
+                from safiron_backend import SafironError
+
+                raise SafironError(invoke.stderr or "Safiron planning evaluation failed.")
+            return invoke
         if not needs_guard_output_retry(invoke.returncode, invoke.content):
             return invoke
 
@@ -645,7 +673,9 @@ class GuardAgentClient:
             return retry
         return invoke
 
-    def check(self, stage: str, payload: Any) -> GuardCheckResult:
+    def check(
+        self, stage: str, payload: Any, *, blackboard: Blackboard | None = None,
+    ) -> GuardCheckResult:
         if not stage_has_guard_skill(stage):
             return _skip_guard_check_result(stage)
 
@@ -654,9 +684,11 @@ class GuardAgentClient:
             if not filter_result.should_invoke:
                 return _filtered_guard_check_result(stage, filter_result)
 
-        message_payload: Any = payload
+        # Filters and recovery operate on the original stage payload. Only the
+        # Guard user message receives the envelope and other-stage context.
+        message_payload: Any = guard_user_payload(stage, payload, blackboard)
         if self._embodied and stage == "post_step":
-            message_payload = _wrap_embodied_payload(payload)
+            message_payload = _wrap_embodied_payload(message_payload)
 
         invoke = self._invoke_guard_with_optional_retry(stage, message_payload)
         returncode = invoke.returncode
@@ -700,6 +732,7 @@ class GuardAgentClient:
                         invocations=payload,
                         recommendation=recommendation,
                         air_assessment=content,
+                        blackboard=blackboard,
                     )
                     recover_message = _stringify_payload(
                         _wrap_embodied_payload(recover_message)
@@ -714,6 +747,7 @@ class GuardAgentClient:
                     invocations=payload,
                     recommendation=recommendation,
                     air_assessment=content,
+                    blackboard=blackboard,
                 )
                 recover_invoke = self._invoke("recover", recover_message)
                 recover_content = recover_invoke.content
@@ -752,6 +786,7 @@ class GuardAgentClient:
                 original_content=original,
                 recommendation=recommendation,
                 stage_reason=outcome.reason,
+                blackboard=blackboard,
             )
 
             recover_invoke = self._invoke(

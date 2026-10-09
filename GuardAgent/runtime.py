@@ -38,7 +38,7 @@ backend = StateBackend()
 checkpointer = MemorySaver()
 STAGE_REGISTRY = load_registry()
 
-_agent_cache: dict[tuple[str, str, bool], Any] = {}
+_agent_cache: dict[tuple[str, str, bool, str | None], Any] = {}
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,7 @@ def build_guard_agent(model_id: str, stage: str, *, embodied: bool = False):
     )
 
     extra_tools: list = []
+    agent_options: dict[str, Any] = {}
     if embodied:
         from embodied_env.prompt import get_embodied_system_prompt
         from embodied_env.tools import create_embodied_tools, get_active_world_profile
@@ -111,6 +112,12 @@ def build_guard_agent(model_id: str, stage: str, *, embodied: bool = False):
             "when the active skill requires incident response."
         )
         extra_tools = create_embodied_tools()
+
+    if entry.skill_name == "safiron":
+        from safiron_backend import SafironContext, safiron_check
+
+        extra_tools.append(safiron_check)
+        agent_options["context_schema"] = SafironContext
 
     return create_deep_agent(
         model=model_id,
@@ -126,11 +133,17 @@ def build_guard_agent(model_id: str, stage: str, *, embodied: bool = False):
             ),
             CodeInterpreterMiddleware(skills_backend=backend),
         ],
+        **agent_options,
     )
 
 
 def _get_cached_agent(model_id: str, stage: str, *, embodied: bool):
-    key = (model_id, stage, embodied)
+    profile = None
+    if embodied:
+        from embodied_env.tools import get_active_world_profile
+
+        profile = get_active_world_profile()
+    key = (model_id, stage, embodied, profile)
     agent = _agent_cache.get(key)
     if agent is None:
         agent = build_guard_agent(model_id, stage, embodied=embodied)
@@ -159,6 +172,21 @@ def invoke_guard_stage(
         apply_embodied_world_snapshot(embodied_world)
 
     try:
+        safiron_context = None
+        invoke_options: dict[str, Any] = {}
+        if STAGE_REGISTRY.get(stage).skill_name == "safiron":
+            from safiron_backend import SafironContext, build_detector_input
+
+            envelope = json.loads(user_message)
+            build_detector_input(envelope)
+            constraints = ""
+            if embodied:
+                from embodied_env.prompt import get_embodied_system_prompt
+                from embodied_env.tools import get_active_world_profile
+
+                constraints = get_embodied_system_prompt(get_active_world_profile())
+            safiron_context = SafironContext(envelope, constraints)
+            invoke_options["context"] = safiron_context
         agent = _get_cached_agent(model_id, stage, embodied=embodied)
         result = agent.invoke(
             {
@@ -170,8 +198,13 @@ def invoke_guard_stage(
                     "thread_id": f"guardagent-{stage}-{uuid.uuid4().hex}",
                 }
             },
+            **invoke_options,
         )
         content = format_assistant_content(result["messages"][-1])
+        if safiron_context is not None:
+            from safiron_backend import format_guard_result
+
+            content = format_guard_result(safiron_context)
         stdout = f"\n{RESULT_MARKER}\n{content}\n{RESULT_MARKER}\n"
         snapshot: dict[str, Any] | None = None
         if embodied and stage == "recover":

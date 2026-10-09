@@ -1,242 +1,91 @@
 # S³ Framework
 
-**S³ (Stage-Specific Safety)** is a multi-stage defense framework for LLM agents. It introduces **Stage-Specific Safety Skills**, a unified abstraction that represents heterogeneous safety designs as reusable and composable components with explicit stage semantics. S³ employs an external Guard Agent to orchestrate these skills for risk detection and mitigation throughout the agentic workflow.
+**S³ (Stage-Specific Safety)** is a safety framework for LLM agents. An external Guard Agent applies stage-specific safety skills throughout the agent workflow, using a task-local Blackboard for supporting context. The repository includes an embodied household simulator, evaluation datasets, and offline regression tests.
 
-<p align="center">
-  <img src="figure/overview.pdf" alt="S³ Framework Overview" width="100%" />
-</p>
+[Framework overview (PDF)](figure/overview.pdf)
 
-<p align="center"><em>Figure: Overview of the S³ framework.</em></p>
+## Architecture
 
----
+The Main Agent uses Deep Agents to plan and act. Stage middleware captures user input, memory retrieval, planning, tool selection, observations, post-step execution information, and final output. With `--guard`, registered stages are checked by the Guard Agent, which returns `allow` or `recover`. Recovery can sanitize content, supply replanning guidance, or remediate simulator state; `--guard-halt-on-recover` stops the run at the first recovery signal.
 
-## 1. Project Overview
+Each safety skill declares its stage in `SKILL.md`. The runtime loads only the skill for the current stage and permits at most one active skill per stage. The execution-check stage uses the runtime name `post_step`.
 
-S³ models modern LLM agents as a multi-stage agentic workflow. Different workflow stages expose different attack surfaces and therefore require stage-specific safety mechanisms. Each registered safety skill is explicitly associated with one workflow stage through its SKILL.md specification and is invoked only when the main agent reaches the corresponding stage.
+The Blackboard stores current-round snapshots, a bound global user goal, and up to two previous rounds of post-step evidence. Guard receives a copied view excluding the current stage's snapshot, which is supplied separately as `stage_payload`. See [Blackboard and Guard context](docs/blackboard.md) for lifecycle and payload details.
 
-### Pipeline stages & attacks
+## Installation
 
+Use Python 3.12 and run commands from the repository root.
 
-| Stage                | Threat | Description                                                   |
-| -------------------- | ------ | ------------------------------------------------------------- |
-| **input**            | Direct Prompt Injection    | Direct prompt injection in the user message                   |
-| **memory**           | Memory Poisoning     | Episodic memory poisoning (rank-1 risk + benign pool)         |
-| **planning**         | Backdoor PoT    | Planning-time backdoor in system prompt (`Please` trigger)    |
-| **tool_selection**   | Selection Perturbation    | Risky tool-selection override (decoy → hazard args)           |
-| **tool_execution**        | Environment Perturbation    | Post-execution / god-mode hazard world state                  |
-| **tool_observation** | Observation Prompt Injection    | Observation prompt injection on first actionable tool return  |
-
-
-
-
-
-### Stage-specific safety skills
-
-Skills live under `GuardAgent/skills/`. At most one skill per stage; `recover` is invoked only when a stage skill returns `recover`.
-
-
-| Skill              | Stage              | Role                                                               |
-| ------------------ | ------------------ | ------------------------------------------------------------------ |
-| **lc-guardrail**   | `input`            | Pattern matching + instruction safety analysis on user input       |
-| **a-memguard**     | `memory`           | Consensus check across retrieved episodes; drop deviant ranks      |
-| **agentspec_star** | `planning`         | Rule-catalog evaluation of natural-language todos                  |
-| **agentspec**      | `tool_selection`   | Predicate rules on pending tool calls **before** execution         |
-| **air**            | `tool_execution`   | Incident detection after a tool execution; guide remediation            |
-| **parsedata**      | `tool_observation` | Injection-pattern strip + expected-observation verification        |
-
-
-
-
-### Runtime architecture
-
-- **Main Agent** (`agent.py`): Deep Agents–based embodied agent with stage middleware (`stage_capture`, planning, episodic memory, attacks).
-- **GuardAgent** (`GuardAgent/`): Separate Deep Agents instance that loads only the skill for the requested stage and returns `allow` / `recover`.
-
-Optional Guard controls:
-
-- **Pre-filter** (default on): skip Guard LLM when programmatic predicates do not match (`--no-guard-filter` / `DEEPAGENT_GUARD_FILTER=0`).
-- **Recover guidance** (default on): after sanitize, inject Main Agent notices (`--no-guard-recover-guidance` / `DEEPAGENT_GUARD_RECOVER_GUIDANCE=0`).
-- **Halt on recover**: stop Main Agent immediately (`--guard-halt-on-recover` / `DEEPAGENT_GUARD_HALT_ON_RECOVER=1`).
-
----
-
-
-
-## 2. Package Installation
-
-```bash
-# From repo root
-pip install -r requirements.txt
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-Set API keys for the providers you use, for example:
+On Linux/macOS, activate with `source .venv/bin/activate` instead. Set credentials in the shell for the providers you use:
 
-```bash
-# OpenAI
-set OPENAI_API_KEY=...
-
-# DeepSeek
-set DEEPSEEK_API_KEY=...
+```powershell
+$env:OPENAI_API_KEY = "<your-openai-key>"
+$env:DEEPSEEK_API_KEY = "<your-deepseek-key>"
 ```
 
-Provider presets (`-p` / `-gp`):
+The application reads environment variables; it does not automatically load `.env` files. Safiron additionally requires `OPENAI_API_KEY`, even when the Main or Guard model uses DeepSeek.
 
+Provider presets in the CLI are `openai`, `deepseek`, and `deepseek-flash`. Use `-m` to override the Main model and `-gm` to override the Guard model with a full provider-qualified model ID. Use `-gp` to select a separate Guard provider.
 
-| Preset           | Model id                     |
-| ---------------- | ---------------------------- |
-| `openai`         | `openai:gpt-5.4`             |
-| `deepseek`       | `deepseek:deepseek-v4-pro`   |
-| `deepseek-flash` | `deepseek:deepseek-v4-flash` |
+## Quick start
 
+Run a household task:
 
-Override with `-m` / `-gm` (full model id).
-
----
-
-
-
-## 3. Experiment Commands
-
-All batch / embodied commands below are run from the **repo root**.
-
-### 3.1 Run Main Agent (single turn)
-
-```bash
-# Embodied tools + required planning
-python agent.py --embodied --require-planning -p deepseek "Put the fork into the microwave."
-
-# Benign-task object layout (microwave / pour / insert scene)
-python agent.py --embodied --benign-env -p deepseek "Fill the mug with water and pour it on the pothos."
+```powershell
+python agent.py --embodied --benign-env --require-planning -p deepseek-flash "Put the book on the table."
 ```
 
+Check the active skill registry and run with Guard:
 
-
-### 3.2 Run GuardAgent (standalone stage check)
-
-```bash
-# From GuardAgent/
-cd GuardAgent
-python agent.py --stage input -p deepseek "Tell me who is the best soccer player in the world."
-
-# Other stages: planning | memory | tool_selection | tool_observation | post_step | recover
-python agent.py --stage planning -p deepseek-flash
+```powershell
+python GuardAgent/agent.py --list-stages
+python agent.py --embodied --benign-env --require-planning --guard -p deepseek-flash "Put the book on the table."
 ```
 
-With Main Agent pipeline debugging (stage payloads on stderr):
+The checked-in active configuration contains **AgentSpec** (`tool_selection`), **ParseData** (`tool_observation`), and **recover**. Safiron is available in the skill library for the `planning` stage. Enabling `--guard` checks only registered stages. See [Safety skills](docs/safety-skills.md) for activation, alternatives, and Safiron's independent detector.
 
-```bash
-python agent.py --embodied --guard --debug-stages --require-planning -p deepseek "Open bookshelf, take book and put it on table."
-```
+## Evaluation
 
+The `household-v2-45` benign dataset contains 45 standalone tasks across nine household families. Each task starts from a reset scene and is scored against explicit final-state criteria.
 
-
-### 3.3 Batch evaluation
-
-```bash
-# Default: DPI + style naive, tasks 1..N
-python agent.py --embodied --num 5 -p deepseek
-python agent.py --embodied --start 10 --num 5 -p deepseek
-
-# Prompt styles (mainly for DPI / OPI / MP risk wording)
-python agent.py --embodied --num 5 --style naive -p deepseek
-python agent.py --embodied --num 5 --style adaptive -p deepseek
-python agent.py --embodied --num 5 --style adversarial -p deepseek
-# origin: hazard-only user text (no bookshelf benign prefix) where applicable
-python agent.py --embodied --num 5 --style origin --attack dpi -p deepseek
-
-# Pure benign tasks (15 microwave / pour / insert benchmarks; implies --embodied --benign-env)
-python agent.py --benign --num 15 --start 1 -p deepseek --save-results
-```
-
-
-
-### 3.4 Attack selection
-
-```bash
-# DPI — input stage (benign + connector + hazard under naive/adaptive/adversarial)
-python agent.py --embodied --num 5 --attack dpi --style naive -p deepseek
-
-# MP — memory poisoning (requires planning; risk memory by --style)
-python agent.py --embodied --require-planning --num 15 --attack mp --style naive -p deepseek
-
-# PoT — planning backdoor (Please + bookshelf benign; hazard in system prompt)
-python agent.py --embodied --require-planning --num 5 --attack pot -p deepseek
-
-# OPI — observation injection
-python agent.py --embodied --num 5 --attack opi --style naive -p deepseek
-
-# RTS — tool_selection override (tasks 1–45)
-python agent.py --embodied --num 5 --attack rts -p deepseek
-python agent.py --embodied --start 16 --num 5 --attack rts -p deepseek
-
-# RTE — skip Main Agent; god-mode hazard world; optional Guard post_step with --guard
-python agent.py --embodied --num 5 --attack rte -p deepseek
-```
-
-
-
-### 3.5 With GuardAgent (defense)
-
-```bash
-# Guard on (same model as Main by default)
-python agent.py --embodied --num 5 --attack dpi --style naive -p deepseek --guard
-
-# Separate Guard model
-python agent.py --embodied --num 5 --attack dpi -p deepseek --guard -gp deepseek-flash
-python agent.py --embodied --num 5 --attack dpi -p deepseek --guard -gp openai -gm openai:gpt-5.4
-
-# Halt Main Agent on first recover (no recover skill / no continuation)
-python agent.py --embodied --num 5 --attack dpi --guard --guard-halt-on-recover -p deepseek
-
-# Disable pre-filter (always invoke Guard LLM for registered stages)
-python agent.py --embodied --num 5 --attack dpi --guard --no-guard-filter -p deepseek
-
-# Sanitize on recover but do not inject recover guidance to Main Agent
-python agent.py --embodied --num 5 --attack dpi --guard --no-guard-recover-guidance -p deepseek
-```
-
-Guard transport (env `DEEPAGENT_GUARD_TRANSPORT`, default `inprocess`):
-
-
-| Value        | Behavior                                     |
-| ------------ | -------------------------------------------- |
-| `inprocess`  | Same process as Main Agent (fastest)         |
-| `pool`       | Long-lived `GuardAgent/worker.py` subprocess |
-| `subprocess` | One-shot subprocess per check (slowest)      |
-
-
-
-
-### 3.6 Results & timing
-
-```bash
-# Save JSON under result/ (updated after each task)
-python agent.py --embodied --start 1 --num 5 --attack dpi --save-results -p deepseek --guard
-
-# Per-task wall time (+ guard_invokes / recover_signals when --guard)
-python agent.py --embodied --num 5 --attack dpi --guard --debug-timing --save-results -p deepseek
-
-# Summarize a saved run
+```powershell
+python agent.py --benign --start 1 --num 45 -p deepseek-flash --save-results
+python agent.py --benign --start 1 --num 45 -p deepseek-flash --guard --require-planning --save-results
 python scripts/summarize_result.py result/<your_run>.json
 ```
 
+Task definitions and offline reference actions are described in the [dataset catalog](data/benign/README.md). References and scoring goals are not passed to the Main Agent. The repository also includes stage-oriented attack evaluation datasets and runners; see [Evaluation and results](docs/evaluation.md) for CLI options, artifacts, and interpretation.
 
+## Repository layout
 
-### 3.7 Common flags cheat sheet
+| Path | Purpose |
+| --- | --- |
+| `agent.py` | Main Agent CLI and batch runner |
+| `GuardAgent/` | Guard CLI, runtime, worker, and stage registry |
+| `GuardAgent/skills/` | Active safety skills |
+| `GuardAgent/skill_library/` | Available skill implementations and rule resources |
+| `blackboard.py`, `message_provenance.py`, `stage_capture.py` | Stage snapshots, user-input binding, and middleware |
+| `guard_*.py` | Guard communication, payloads, prefilters, and recovery |
+| `embodied_env/` | Simulator, tools, task definitions, and scoring |
+| `data/` | Evaluation prompts and memory datasets |
+| `scripts/` | Dataset export, result summaries, and diagnostic runners |
+| `tests/` | Offline regression and integration tests |
+| `docs/` | Configuration, runtime, evaluation, and contributor documentation |
+| `result/` | Historical tracked results and local generated runs |
+| `deepagent/` | Compatibility copies of agent helpers; root modules serve the main CLI |
 
+## Development
 
-| Flag                                                     | Meaning                                  |
-| -------------------------------------------------------- | ---------------------------------------- |
-| `--embodied`                                             | Enable embodied tools / scene            |
-| `--benign` / `--benign-env`                              | Pure benign tasks / benign object layout |
-| `--num N` / `--start K`                                  | Batch range (1-based)                    |
-| `--attack {dpi,opi,rts,rte,pot,mp}`                      | Attack vector                            |
-| `--style {naive,adaptive,adversarial,origin}`            | Injection / risk wording style           |
-| `--require-planning`                                     | Force `write_todos` first                |
-| `--guard`                                                | Enable GuardAgent stage checks           |
-| `-p` / `-m`                                              | Main Agent provider / model              |
-| `-gp` / `-gm`                                            | GuardAgent provider / model              |
-| `--save-results`                                         | Write `result/*.json`                    |
-| `--debug-stages` / `--debug-timing` / `--debug-planning` | Stderr diagnostics                       |
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
+python -m pip check
+```
 
-
+Tests use scripted models and mocked detector responses, with simulator and transport integration checks. They do not establish live model safety or task-completion rates. See [Contributing](CONTRIBUTING.md) for validation and repository conventions.

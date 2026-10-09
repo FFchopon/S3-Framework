@@ -66,6 +66,7 @@ def apply_embodied_world_snapshot(data: dict) -> None:
     """Restore text environment from a snapshot (e.g. after GuardAgent post_step remediation)."""
     world = world_from_dict(data)
     reconcile_world_consistency(world)
+    set_benign_env_enabled(world.profile == "benign")
     get_embodied_environment().world = world
 
 

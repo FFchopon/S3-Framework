@@ -17,7 +17,7 @@ from .episode_store import (
     get_active_episode_user_id,
 )
 from .memory_dataset import MP_MEMORY_TOP_K
-from .stage_capture import StageCaptureState, _apply_guard_incident_halt, emit_stage_debug
+from stage_capture import StageCaptureState, _apply_guard_incident_halt, emit_stage_debug
 
 SEARCH_PAST_CONVERSATIONS_TOOL_NAME = "search_past_conversations"
 STAGE_MEMORY = "memory"

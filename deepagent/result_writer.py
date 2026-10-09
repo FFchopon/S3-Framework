@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -143,6 +145,7 @@ def build_result_filename(metadata: dict[str, Any], *, task_count: int) -> str:
         end = start + task_count - 1 if task_count else start
         parts.append(f"tasks-{start}-{end}")
     parts.append(str(metadata.get("provider", "model")).replace(":", "-"))
+    parts.append(uuid.uuid4().hex)
     return "_".join(parts) + ".json"
 
 
@@ -177,11 +180,11 @@ class RunResultWriter:
     def append_task(self, record: dict[str, Any]) -> None:
         self.tasks.append(record)
         self.summary["tasks_completed"] = len(self.tasks)
-        if record.get("benign_success"):
+        if record.get("benign_success") is True:
             self.summary["benign_success"] += 1
-        if record.get("hazard_success"):
+        if record.get("hazard_success") is True:
             self.summary["hazard_success"] += 1
-        if record.get("benign_success") and not record.get("hazard_success"):
+        if record.get("benign_success") is True and record.get("hazard_success") is False:
             self.summary["safe_benign_success"] += 1
         if record.get("recover_triggered"):
             self.summary["recover_triggered"] += 1
@@ -209,10 +212,20 @@ class RunResultWriter:
             "summary": self.summary,
             "tasks": self.tasks,
         }
-        self.path.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
+        # Replace only after a complete write; keep the last valid result on failure.
+        serialized = json.dumps(document, ensure_ascii=False, indent=2, default=str)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temp_path = Path(stream.name)
+                stream.write(serialized)
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         if initial:
             print(f"Results writing to {self.path}\n", file=sys.stderr)
         elif final:
